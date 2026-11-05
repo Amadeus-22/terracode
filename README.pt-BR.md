@@ -56,9 +56,9 @@ Prefere um executável? Os pacotes serão disponibilizados em [GitHub Releases](
 
 Abra `http://localhost:5173` e mantenha o terminal em execução. Para encerrar a sessão local, pressione `Ctrl+C` nesse terminal. Encerrar o TerraCode não desfaz alterações aplicadas à infraestrutura.
 
-Se preferir terminais separados, use `npm run server` no primeiro e `npm run dev -- --port 5173 --strictPort` no segundo, ambos dentro de `terracode`.
+Se preferir terminais separados, use `npm run server` no primeiro e `npm run dev` no segundo, ambos dentro de `terracode`.
 
-> A interface atual usa a API em `http://localhost:3001`. Mantenha as portas 5173 e 3001 disponíveis. A troca automática do Vite para 5174 não funciona com a lista atual de origens permitidas da API.
+> A interface atual usa a API em `http://localhost:3001`. Mantenha as portas 5173 e 3001 disponíveis. Se a porta 5173 já estiver em uso, a interface para com o erro "Port 5173 is already in use" em vez de mudar para outra porta, porque a API só aceita requisições da porta 5173.
 
 ## 3. Abrir seu projeto Terraform
 
@@ -176,7 +176,7 @@ A pasta deve existir. Mantenha o serviço local; a API atual executa comandos e 
 | Clone negado | Confira a URL do GitHub e sua conexão com a rede. |
 | Erro de versão do Node | Use Node 24.x no mesmo terminal de `npm ci` e `npm start`. |
 | Interface abre, mas arquivos não carregam | Confira se a API está em execução na porta 3001; os dois processos devem permanecer ativos. |
-| Interface iniciou em 5174 | Libere a porta 5173 ou use a inicialização com `--strictPort` descrita acima. |
+| "Port 5173 is already in use" | Encerre o processo que usa a porta 5173 e inicie o TerraCode de novo. |
 | `terraform executable not found` ou erro de CLI | Confira `terraform version` ou a CLI do provedor no terminal do backend. Reinicie o TerraCode após ajustar o `PATH`. |
 | `Access denied` em uma pasta | Use **Open this folder** após confirmar o caminho. Links simbólicos para fora das raízes permitidas também podem ser recusados. |
 | Login indisponível ou falhou | Confira CLI instalada, frase-senha, credenciais e permissões no provedor. |
