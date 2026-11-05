@@ -34,7 +34,6 @@ type FileExplorerProps = {
   onGitContext?: (dirPath: string, status: GitStatusResult | null) => void
 }
 
-const DEFAULT_ROOT = '/home/pedroantonio/github/code/app-test'
 
 function sortEntries(entries: Entry[]): Entry[] {
   return [...entries].sort((a, b) => {
@@ -247,7 +246,8 @@ const FileExplorer = ({
   externalRefresh,
   onGitContext
 }: FileExplorerProps): ReactElement => {
-  const [requestedPath, setRequestedPath] = useState(DEFAULT_ROOT)
+  // Empty until the server reports its allowed roots (or a root is requested).
+  const [requestedPath, setRequestedPath] = useState('')
   const [tree, setTree] = useState<TreeResult | null>(null)
 
   // Git status of the loaded root (badges + commit panel); null when unknown.
@@ -282,10 +282,6 @@ const FileExplorer = ({
   const [roots, setRoots] = useState<RootsResult | null>(null)
   const [removingRoot, setRemovingRoot] = useState('')
   const [rootError, setRootError] = useState('')
-
-  useEffect(() => {
-    listRoots().then(setRoots).catch(() => setRoots(null))
-  }, [])
 
   const loadRoot = useCallback(async (dirPath: string) => {
     const trimmed = dirPath.trim()
@@ -388,9 +384,21 @@ const FileExplorer = ({
   }, [requestedPath, rootStatus, treeReady, onGitContext])
 
   useEffect(() => {
-    // Initial data fetch on mount: synchronizing with the external backend.
-    void loadRoot(DEFAULT_ROOT) // eslint-disable-line react/set-state-in-effect
-  }, [loadRoot])
+    // Initial data fetch on mount: start in the server's first allowed root
+    // (BASE_DIR) unless the parent already requested one.
+    listRoots()
+      .then(result => {
+        setRoots(result)
+        const first = result.roots[0]
+        if (!first || requestedRoot) return
+        setRequestedPath(first)
+        void loadRoot(first)
+      })
+      .catch(err => {
+        setRoots(null)
+        setTree({ path: '', error: err instanceof Error ? err.message : 'Failed to load allowed roots' })
+      })
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Follow an externally requested root (e.g. a Terraform project loaded via
   // the panel's picker). Only reacts to changes of the prop itself, so manual
