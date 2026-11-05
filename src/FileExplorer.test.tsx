@@ -31,6 +31,35 @@ describe('FileExplorer Component', () => {
     expect(screen.getByText(/Root:/)).toBeInTheDocument()
   })
 
+  it('starts in the first allowed root reported by the server', async () => {
+    ;(listRoots as any).mockResolvedValue({ roots: ['/srv/base', '/srv/extra'], removableRoots: ['/srv/extra'] })
+
+    render(<FileExplorer onSelectFile={vi.fn()} />)
+
+    await waitFor(() => expect(listDir).toHaveBeenCalledWith('/srv/base'))
+    expect(screen.getByText('Root: /srv/base')).toBeInTheDocument()
+    expect(listDir).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a root requested by the parent instead of the server default', async () => {
+    ;(listRoots as any).mockResolvedValue({ roots: ['/srv/base'], removableRoots: [] })
+
+    render(<FileExplorer onSelectFile={vi.fn()} requestedRoot="/srv/project" />)
+
+    await waitFor(() => expect(screen.getByText('Root: /srv/project')).toBeInTheDocument())
+    await waitFor(() => expect(listRoots).toHaveBeenCalled())
+    expect(listDir).not.toHaveBeenCalledWith('/srv/base')
+  })
+
+  it('shows an error when the allowed roots cannot be loaded', async () => {
+    ;(listRoots as any).mockRejectedValue(new Error('API unreachable'))
+
+    render(<FileExplorer onSelectFile={vi.fn()} />)
+
+    await waitFor(() => expect(screen.getByText(/API unreachable/)).toBeInTheDocument())
+    expect(listDir).not.toHaveBeenCalled()
+  })
+
   it('should show loading state initially', async () => {
     ;(listDir as any).mockImplementation(() => new Promise(resolve => setTimeout(() => resolve([]), 100)))
     render(<FileExplorer onSelectFile={vi.fn()} />)
