@@ -56,9 +56,9 @@ Prefer an executable? Packages will be listed under [GitHub Releases](https://gi
 
 Open `http://localhost:5173` and keep the terminal running. Press `Ctrl+C` in that terminal to stop the local session. Stopping TerraCode does not roll back infrastructure changes.
 
-To use separate terminals, run `npm run server` in the first and `npm run dev -- --port 5173 --strictPort` in the second, both from `terracode`.
+To use separate terminals, run `npm run server` in the first and `npm run dev` in the second, both from `terracode`.
 
-> The current frontend calls the API at `http://localhost:3001`. Keep ports 5173 and 3001 available. Vite automatically switching to port 5174 is incompatible with the API's current allowed browser origins.
+> The current frontend calls the API at `http://localhost:3001`. Keep ports 5173 and 3001 available. If port 5173 is already in use, the interface stops with a "Port 5173 is already in use" error instead of moving to another port, because the API only accepts requests from port 5173.
 
 ## 3. Open a Terraform project
 
@@ -176,7 +176,7 @@ The folder must exist. Keep the service local: the current API performs file ope
 | Clone denied | Check the GitHub URL and your network connection. |
 | Unsupported Node version | Use Node 24.x in the terminal running `npm ci` and `npm start`. |
 | Interface opens but files do not load | Ensure the API is running on port 3001. Both processes must remain active. |
-| Interface started on port 5174 | Free port 5173 or use the `--strictPort` startup described above. |
+| "Port 5173 is already in use" | Stop the process using port 5173 and start TerraCode again. |
 | Terraform or a cloud CLI cannot be found | Check `terraform version` or the cloud CLI in the backend's terminal. Restart TerraCode after changing `PATH`. |
 | Folder access denied | Verify the path and use **Open this folder**. Symlinks outside the allowed roots can also be rejected. |
 | Cloud login unavailable or failing | Check the CLI installation, passphrase, credentials, and provider permissions. |
