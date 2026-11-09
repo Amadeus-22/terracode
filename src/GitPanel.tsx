@@ -47,6 +47,18 @@ type OpStatus = {
 
 const PLATFORM_LABEL: Record<string, string> = { github: 'GitHub', gitlab: 'GitLab' }
 
+// Git output that means "no usable credentials" — the stored-credentials tip
+// only helps in this case, not on conflicts or rejections.
+const AUTH_FAIL_RE = /could not read Username|Authentication failed|terminal prompts disabled|invalid credentials|403 (Unauthorized|Forbidden)/i
+
+function withAuthHint(text: string, output?: string): { text: string; output?: string } {
+  if (!output || !AUTH_FAIL_RE.test(output)) return { text, output }
+  return {
+    text,
+    output: `${output}\n\nTip: store your GitHub/GitLab token in Settings → Git credentials and unlock the credential store — push/pull/fetch will then authenticate automatically.`
+  }
+}
+
 const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommit, openCommitHash }: GitPanelProps): ReactElement => {
   const [branches, setBranches] = useState<GitBranches | null>(null)
   const [remotes, setRemotes] = useState<{ remotes: GitRemote[] } | null>(null)
@@ -271,7 +283,7 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
       const result = await gitPush(dirPath)
       onRefresh()
       if (result.success) setOpStatus({ kind: 'ok', text: 'Pushed to origin', output: result.output })
-      else setOpStatus({ kind: 'error', text: 'Push failed — check your credentials/remote', output: result.output })
+      else setOpStatus({ kind: 'error', ...withAuthHint('Push failed — check your credentials/remote', result.output) })
     })
   }
 
@@ -281,7 +293,7 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
       onRefresh()
       if (result.success) setOpStatus({ kind: 'ok', text: 'Pulled from origin', output: result.output })
       else if (result.conflicted) setOpStatus({ kind: 'error', text: 'Pull stopped with conflicts — resolve and commit.', output: result.output })
-      else setOpStatus({ kind: 'error', text: 'Pull failed', output: result.output })
+      else setOpStatus({ kind: 'error', ...withAuthHint('Pull failed', result.output) })
     })
   }
 
@@ -290,7 +302,7 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
       const result = await gitFetch(dirPath)
       onRefresh()
       if (result.success) setOpStatus({ kind: 'ok', text: 'Fetched all remotes', output: result.output })
-      else setOpStatus({ kind: 'error', text: 'Fetch failed', output: result.output })
+      else setOpStatus({ kind: 'error', ...withAuthHint('Fetch failed', result.output) })
     })
   }
 
@@ -333,6 +345,12 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
           Initial branch name
         </label>
         <input id="init-branch" className="git-input" value={initBranch} onChange={e => setInitBranch(e.target.value)} />
+        {initRemoteUrl.trim() !== '' && (
+          <p className="git-note">
+            Push and pull will use the GitHub/GitLab credentials stored in Settings → Git credentials (unlock the store
+            first). Existing SSH or system credential setups keep working as before.
+          </p>
+        )}
         <button onClick={() => void handleInit()} disabled={busy !== null}>
           {busy ? 'Working…' : initRemoteUrl.trim() ? 'Initialize + add origin' : 'Initialize repository'}
         </button>

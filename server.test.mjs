@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
+import { execFile } from 'node:child_process'
 
 // Fixture layout (created in beforeAll):
 //   base/
@@ -19,14 +20,15 @@ import path from 'node:path'
 //       link-dir -> ..                   (directory symlink escaping the root)
 
 // Fake terraform binary so the /api/tf/run tests never depend on a real
-// installation. fmt strips trailing whitespace from .tf files (and prints the
-// changed ones), validate greps for an INVALID marker, plan sleeps briefly and
-// sleeps much longer when a .slow-plan marker file is present. Lifecycle
-// commands: init/output/state/apply are static fixtures; mutating invocations
-// are recorded in .init-log / .apply-log (args verbatim) so tests can assert
-// the fixed server-side arguments. plan -json emits an NDJSON stream with one
-// resource_change per line (skipped when a .plan-nochanges marker exists), and
-// -out=<file> touches that file like a real saved execution plan.
+// installation. All commands emit text-mode output, exactly like a shell. fmt
+// strips trailing whitespace from .tf files (and prints the changed ones),
+// validate greps for an INVALID marker, plan sleeps briefly and sleeps much
+// longer when a .slow-plan marker file is present. Lifecycle commands:
+// init/output/state/apply are static fixtures; mutating invocations are
+// recorded in .init-log / .apply-log (args verbatim) so tests can assert the
+// fixed server-side arguments. plan prints per-resource header lines (skipped
+// when a .plan-nochanges marker exists), and -out=<file> touches that file
+// like a real saved execution plan.
 const FAKE_TERRAFORM_SCRIPT = `#!/bin/bash
 # Record any injected cloud-credential env vars (empty file when none).
 env | grep -E '^(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AWS_REGION|ARM_CLIENT_ID|ARM_CLIENT_SECRET|ARM_TENANT_ID|ARM_SUBSCRIPTION_ID|AZURE_CLIENT_ID|AZURE_CLIENT_SECRET|AZURE_TENANT_ID|AZURE_SUBSCRIPTION_ID|GOOGLE_APPLICATION_CREDENTIALS|GOOGLE_CLOUD_PROJECT)=' > "\${PWD}/.cred-env" 2>/dev/null || true
@@ -47,10 +49,10 @@ case "$1" in
     ;;
   validate)
     if grep -rq 'INVALID' --include='*.tf' .; then
-      printf '%s\\n' '{"format_version":"1.0","valid":false,"error_count":1,"warning_count":0,"diagnostics":[{"severity":"error","summary":"Invalid reference","detail":"An invalid reference to INVALID was detected."}]}'
+      printf '%s\n' '╷' '│ Error: Invalid reference' '│' '│   with resource "bad" "x",' '╵'
       exit 1
     fi
-    printf '%s\\n' '{"format_version":"1.0","valid":true,"error_count":0,"warning_count":0,"diagnostics":[]}'
+    echo 'Success! The configuration is valid.'
     exit 0
     ;;
   init)
@@ -59,7 +61,8 @@ case "$1" in
     exit 0
     ;;
   output)
-    printf '%s\\n' '{"env":{"value":"prod","type":"string","sensitive":false},"secret_key":{"value":"hidden-value","type":"string","sensitive":true}}'
+    echo 'env = "prod"'
+    echo 'secret_key = (sensitive value)'
     exit 0
     ;;
   state)
@@ -89,39 +92,30 @@ case "$1" in
   plan)
     if [ -f .slow-plan ]; then sleep 4; fi
     printf '%s\n' "$*" > .plan-args
-    json=0
     destroy=0
     detailed=0
     for a in "$@"; do
       case "$a" in
-        -json) json=1 ;;
         -destroy) destroy=1 ;;
         -detailed-exitcode) detailed=1 ;;
         -out=*) touch "\${a#-out=}" ;;
       esac
     done
-    if [ "$json" = "1" ]; then
-      printf '%s\n' '{"type":"planned_values","values":{}}'
-      changes=0
-      if [ ! -f .plan-nochanges ]; then
-        changes=1
-        printf '%s\n' '{"type":"resource_change","address":"aws_instance.web","change":{"actions":["create"],"before":null,"after":{"instance_type":"t2.micro"},"after_unknown":{}},"resource":{"mode":"managed","type":"aws_instance","name":"web"}}'
-        printf '%s\n' '{"type":"resource_change","address":"aws_s3_bucket.logs","change":{"actions":["update"],"before":{"bucket":"logs-old","acl":"private"},"after":{"bucket":"logs-new","acl":null},"after_unknown":{"bucket":false,"acl":true}},"resource":{"mode":"managed","type":"aws_s3_bucket","name":"logs"}}'
-        printf '%s\n' '{"type":"resource_change","address":"aws_iam_role.old","change":{"actions":["create","delete"]},"resource":{"mode":"managed","type":"aws_iam_role","name":"old"}}'
-      fi
-      if [ "$detailed" = "1" ]; then
-        # -detailed-exitcode: 2 when changes were detected, 0 otherwise.
-        if [ "$changes" = "1" ]; then exit 2; else exit 0; fi
-      fi
-      exit 0
-    fi
     sleep 0.5
     echo 'Terraform used the selected providers to generate the following execution plan.'
+    changes=0
     if [ "$destroy" = "1" ]; then
       echo 'Plan: 0 to add, 0 to change, 1 to destroy.'
+    elif [ -f .plan-nochanges ]; then
+      echo 'No changes. Your infrastructure matches the configuration.'
     else
-      echo 'Plan: 1 to add, 0 to change, 0 to destroy.'
+      changes=1
+      echo '  # aws_instance.web will be created'
+      echo '  # aws_s3_bucket.logs will be updated in-place'
+      echo '  # aws_iam_role.old must be replaced'
+      echo 'Plan: 1 to add, 1 to change, 0 to destroy.'
     fi
+    if [ "$detailed" = "1" ] && [ "$changes" = "1" ]; then exit 2; fi
     exit 0
     ;;
   apply)
@@ -134,11 +128,8 @@ case "$1" in
     exit 0
     ;;
   version)
-    if [ "$2" = "-json" ]; then
-      printf '%s\\n' '{"terraform_version":"1.9.8","platform":"linux_amd64"}'
-    else
-      echo 'Terraform v1.5.0'
-    fi
+    echo 'Terraform v1.9.8'
+    echo 'on linux_amd64'
     exit 0
     ;;
   workspace)
@@ -283,6 +274,7 @@ exit 1
 //   .git/noop-add          when present, `add` stages nothing (clean tree)
 //   .git/op-log            one line per mutating op (branch/checkout/merge/rebase/
 //                          push/pull/fetch/init/remote add), args verbatim
+//   .git/env-log           auth-related env vars recorded on each push/pull/fetch
 //   .git/origin-url        url recorded by `remote add origin <url>`
 //   .git/init-meta         "branch=<name>" when init was given -b <name>
 //   .git/merge-conflict    when present, merge exits 1 with conflict output
@@ -306,6 +298,18 @@ if [ ! -d .git ]; then
   echo 'fatal: not a git repository (or any of the parent directories): .git' >&2
   exit 128
 fi
+
+# Record the auth-related env vars the server injected for network ops.
+log_env() {
+  {
+    printf 'GIT_ASKPASS=%s\\n' "\${GIT_ASKPASS:-}"
+    printf 'TC_GH_HOST=%s\\n' "\${TC_GH_HOST:-}"
+    printf 'TC_GH_USER=%s\\n' "\${TC_GH_USER:-}"
+    printf 'TC_GH_TOKEN=%s\\n' "\${TC_GH_TOKEN:-}"
+    printf 'TC_GL_HOST=%s\\n' "\${TC_GL_HOST:-}"
+    printf 'GIT_TERMINAL_PROMPT=%s\\n' "\${GIT_TERMINAL_PROMPT:-}"
+  } >> .git/env-log
+}
 
 case "$1" in
   status)
@@ -377,6 +381,7 @@ case "$1" in
     ;;
   push)
     printf '%s\\n' "$*" >> .git/op-log
+    log_env
     if [ -f .git/push-fail ]; then
       echo 'fatal: could not read Username for https://github.com: terminal prompts disabled' >&2
       exit 128
@@ -387,6 +392,7 @@ case "$1" in
     ;;
   pull)
     printf '%s\\n' "$*" >> .git/op-log
+    log_env
     if [ -f .git/pull-conflict ]; then
       echo 'Auto-merging file.txt' >&2
       echo 'CONFLICT (content): Merge conflict in file.txt' >&2
@@ -397,6 +403,7 @@ case "$1" in
     ;;
   fetch)
     printf '%s\\n' "$*" >> .git/op-log
+    log_env
     echo 'From github.com:owner/repo'
     exit 0
     ;;
@@ -456,6 +463,7 @@ exit 0
 let base = ''
 let root = ''
 let app = null
+let serverModule = null
 let startFileWatcher = null
 let stopFileWatcher = null
 let registryServer = null
@@ -492,7 +500,7 @@ JSON
 exit 0`
 
 beforeAll(async () => {
-  base = fs.mkdtempSync(path.join(os.tmpdir(), 'app-test-api-'))
+  base = fs.mkdtempSync(path.join(os.tmpdir(), 'terracode-api-'))
   root = path.join(base, 'root')
   fs.mkdirSync(path.join(root, 'sub'), { recursive: true })
   fs.writeFileSync(path.join(base, 'outside.txt'), 'OUTSIDE SECRET\n')
@@ -598,7 +606,7 @@ beforeAll(async () => {
   process.env.TFENV_DISABLE = '1'
 
   process.env.BASE_DIR = root
-  const serverModule = await import('./server.cjs')
+  serverModule = await import('./server.cjs')
   app = serverModule.default
   startFileWatcher = serverModule.startFileWatcher
   stopFileWatcher = serverModule.stopFileWatcher
@@ -1292,18 +1300,17 @@ describe('POST /api/tf/run', () => {
     fs.writeFileSync(path.join(dir, 'main.tf'), 'resource "ok" "fine" {}\n')
     const res = await request(app).post('/api/tf/run').send({ command: 'validate', path: dir })
     expect(res.status).toBe(200)
-    expect(res.body.valid).toBe(true)
-    expect(res.body.errorCount).toBe(0)
+    expect(res.body.exitCode).toBe(0)
+    expect(res.body.output).toContain('Success! The configuration is valid.')
   })
 
-  it('validate reports diagnostics for an invalid configuration', async () => {
+  it('validate reports a failing exit code and error output for an invalid configuration', async () => {
     const dir = tfDir('invalid')
     fs.writeFileSync(path.join(dir, 'main.tf'), 'resource "bad" "x" {\n  value = INVALID\n}\n')
     const res = await request(app).post('/api/tf/run').send({ command: 'validate', path: dir })
     expect(res.status).toBe(200)
-    expect(res.body.valid).toBe(false)
-    expect(res.body.errorCount).toBe(1)
-    expect(res.body.diagnostics[0].summary).toContain('Invalid reference')
+    expect(res.body.exitCode).toBe(1)
+    expect(res.body.output).toContain('Invalid reference')
   })
 
   it('plan returns output and exit code', async () => {
@@ -1349,55 +1356,39 @@ describe('POST /api/tf/run (lifecycle)', () => {
     expect(fs.readFileSync(path.join(dir, '.init-log'), 'utf-8').trim()).toBe('init -input=false -no-color')
   })
 
-  it('plan-json parses the NDJSON stream into a summary and resource list', async () => {
+  it('plan parses the text output into a per-action summary', async () => {
     const dir = tfDir('plan')
     fs.rmSync(path.join(dir, '.plan-nochanges'), { force: true })
-    const res = await request(app).post('/api/tf/run').send({ command: 'plan-json', path: dir })
+    const res = await request(app).post('/api/tf/run').send({ command: 'plan', path: dir })
     expect(res.status).toBe(200)
     expect(res.body.exitCode).toBe(0)
+    // Counted from the per-resource header lines (create / update / replace).
     expect(res.body.summary).toEqual({ add: 1, update: 1, replace: 1, destroy: 0 })
-    expect(res.body.resources).toHaveLength(3)
-    const web = res.body.resources.find(r => r.address === 'aws_instance.web')
-    expect(web.actions).toEqual(['create'])
-    expect(web.type).toBe('aws_instance')
-    expect(web.name).toBe('web')
-
-    // Plan deep-dive: per-resource attribute diffs from before/after.
-    // Create with a known after → each attribute gets its own row (null → value).
-    expect(web.changes).toEqual([{ path: 'instance_type', before: null, after: 't2.micro' }])
-
-    const logs = res.body.resources.find(r => r.address === 'aws_s3_bucket.logs')
-    // Update: changed value plus a value only known after apply (after_unknown).
-    expect(logs.changes).toEqual([
-      { path: 'bucket', before: 'logs-old', after: 'logs-new' },
-      { path: 'acl', before: 'private', after: null, unknown: true }
-    ])
-
-    // Replace without before/after in the fixture → no attribute rows.
-    const old = res.body.resources.find(r => r.address === 'aws_iam_role.old')
-    expect(old.changes).toEqual([])
+    // The raw shell output is returned verbatim.
+    expect(res.body.output).toContain('# aws_instance.web will be created')
+    expect(res.body.output).toContain('Plan: 1 to add, 1 to change, 0 to destroy.')
   })
 
-  it('plan-json reports an empty summary when nothing changes', async () => {
+  it('plan reports a zero summary when nothing changes', async () => {
     const dir = tfDir('valid')
     fs.writeFileSync(path.join(dir, '.plan-nochanges'), '')
     try {
-      const res = await request(app).post('/api/tf/run').send({ command: 'plan-json', path: dir })
+      const res = await request(app).post('/api/tf/run').send({ command: 'plan', path: dir })
       expect(res.status).toBe(200)
       expect(res.body.summary).toEqual({ add: 0, update: 0, replace: 0, destroy: 0 })
-      expect(res.body.resources).toEqual([])
+      expect(res.body.output).toContain('No changes.')
     } finally {
       fs.rmSync(path.join(dir, '.plan-nochanges'), { force: true })
     }
   })
 
-  it('output parses JSON outputs and flags sensitive values', async () => {
+  it('output returns the text-mode values', async () => {
     const dir = tfDir('valid')
     const res = await request(app).post('/api/tf/run').send({ command: 'output', path: dir })
     expect(res.status).toBe(200)
     expect(res.body.exitCode).toBe(0)
-    expect(res.body.outputs.env.value).toBe('prod')
-    expect(res.body.outputs.secret_key.sensitive).toBe(true)
+    expect(res.body.output).toContain('env = "prod"')
+    expect(res.body.output).toContain('(sensitive value)')
   })
 
   it('state-list returns the resource addresses from state', async () => {
@@ -1460,7 +1451,7 @@ describe('POST /api/tf/run (lifecycle)', () => {
 describe('POST /api/tf/run (new commands)', () => {
   const tfDir = (name) => path.join(root, 'tf', name)
 
-  it('version parses terraform version -json into version + platform', async () => {
+  it('version parses the text output into version + platform', async () => {
     const dir = tfDir('valid')
     const res = await request(app).post('/api/tf/run').send({ command: 'version', path: dir })
     expect(res.status).toBe(200)
@@ -1649,7 +1640,9 @@ describe('POST /api/tf/run (new commands)', () => {
     fs.writeFileSync(path.join(dir, 'prod.tfvars'), 'env = "prod"\n')
     const ok = await request(app).post('/api/tf/run').send({ command: 'plan', path: dir, varFile: 'prod.tfvars' })
     expect(ok.status).toBe(200)
-    expect(fs.readFileSync(path.join(dir, '.plan-args'), 'utf-8').trim()).toBe('plan -no-color -var-file=prod.tfvars')
+    expect(fs.readFileSync(path.join(dir, '.plan-args'), 'utf-8').trim()).toBe(
+      'plan -input=false -no-color -var-file=prod.tfvars'
+    )
 
     const missing = await request(app).post('/api/tf/run').send({ command: 'plan', path: dir, varFile: 'nope.tfvars' })
     expect(missing.status).toBe(400)
@@ -1859,7 +1852,9 @@ describe('cloud credentials & login (/api/cloud/*)', () => {
     expect(res.status).toBe(200)
     expect(res.body.exists).toBe(true)
     expect(res.body.providers).toEqual(['aws'])
-    expect(res.body.unlocked).toBe(false)
+    // Creating proves passphrase knowledge: the store is left unlocked so
+    // immediate follow-ups (login, test, git ops) work without re-entering it.
+    expect(res.body.unlocked).toBe(true)
     // The response must not contain the secret.
     expect(JSON.stringify(res.body)).not.toContain('wJalrXUtnFEMI')
 
@@ -1882,6 +1877,8 @@ describe('cloud credentials & login (/api/cloud/*)', () => {
   })
 
   it('login while locked without a passphrase fails (401)', async () => {
+    // create left the store unlocked; lock explicitly to test the locked path.
+    await request(app).post('/api/cloud/credentials').send({ action: 'lock' })
     const res = await request(app).post('/api/cloud/login').send({ provider: 'aws' })
     expect(res.status).toBe(401)
     expect(res.body.error).toContain('locked')
@@ -1914,6 +1911,8 @@ describe('cloud credentials & login (/api/cloud/*)', () => {
       .send({ action: 'update', passphrase: PASS, credentials: { ...AZURE_CREDS, gcp: { serviceAccountJson: SA_JSON, projectId: '' } } })
     expect(add.status).toBe(200)
     expect([...add.body.providers].sort()).toEqual(['aws', 'azure', 'gcp'])
+    // update also leaves the store unlocked — the logins below rely on that.
+    expect(add.body.unlocked).toBe(true)
 
     const az = await request(app).post('/api/cloud/login').send({ provider: 'azure' })
     expect(az.status).toBe(200)
@@ -2665,6 +2664,7 @@ describe('git branch/remote/sync operations', () => {
   let rebaseOk = ''
   let rebaseConflict = ''
   let pushFail = ''
+  let detachedPush = '' // repo with no .git/current-branch (detached HEAD)
   let pullConflict = ''
   let alreadyRepo = ''
   let initTarget = '' // non-repo dir (no .git) for the git init test
@@ -2700,6 +2700,7 @@ describe('git branch/remote/sync operations', () => {
     rebaseOk = mk('rebaseok', { currentBranch: 'main', branchesList: 'main\ndev\n' })
     rebaseConflict = mk('rebaseconflict', { markers: ['rebase-conflict'] })
     pushFail = mk('pushfail', { markers: ['push-fail'] })
+    detachedPush = mk('detachedpush')
     pullConflict = mk('pullconflict', { markers: ['pull-conflict'] })
     alreadyRepo = mk('alreadyrepo')
 
@@ -2905,11 +2906,32 @@ describe('git branch/remote/sync operations', () => {
   })
 
   describe('POST /api/git/push', () => {
-    it('pushes the current branch to origin with -u', async () => {
+    it('pushes the current branch to origin with -u (explicit refspec)', async () => {
       const res = await request(app).post('/api/git/push').send({ path: mergeOk })
       expect(res.status).toBe(200)
       expect(res.body.success).toBe(true)
+      // Regression: `git push -u origin` without a refspec fails on branches
+      // with no upstream ("no upstream branch") — the current branch must be
+      // passed explicitly so new branches push and track in one step.
       const log = fs.readFileSync(path.join(mergeOk, '.git', 'op-log'), 'utf-8')
+      expect(log.split('\n')).toContain('push -u origin main')
+      expect(res.body.branch).toBe('main')
+    })
+
+    it('passes an explicit branch through unchanged', async () => {
+      const res = await request(app).post('/api/git/push').send({ path: mergeOk, branch: 'feature-x' })
+      expect(res.status).toBe(200)
+      expect(res.body.success).toBe(true)
+      expect(res.body.branch).toBe('feature-x')
+      const log = fs.readFileSync(path.join(mergeOk, '.git', 'op-log'), 'utf-8')
+      expect(log.split('\n')).toContain('push -u origin feature-x')
+    })
+
+    it('falls back to a plain push from detached HEAD (no branch name)', async () => {
+      const res = await request(app).post('/api/git/push').send({ path: detachedPush })
+      expect(res.status).toBe(200)
+      expect(res.body.success).toBe(true)
+      const log = fs.readFileSync(path.join(detachedPush, '.git', 'op-log'), 'utf-8')
       expect(log.split('\n')).toContain('push -u origin')
     })
 
@@ -3225,5 +3247,234 @@ describe('Terraform graph / drift / registry / cost', () => {
       const res = await request(app).post('/api/tf/cost').send({ path: '/etc' })
       expect(res.status).toBe(403)
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Git credentials (GitHub/GitLab): persistent encrypted store + askpass auth.
+// Reuses the same TF_CODE_CRED_DIR store as the cloud suite, which ends with no
+// store present — this block starts from that clean slate and manages its own.
+// ---------------------------------------------------------------------------
+
+describe('git credentials (/api/git/credentials*)', () => {
+  const PASS = 'git-creds-pass-12345'
+  const GH_TOKEN = 'gh-token-abc123'
+  const GL_TOKEN = 'gl-token-xyz789'
+  const storeFile = () => path.join(process.env.TF_CODE_CRED_DIR, 'credentials.enc')
+
+  it('reports an empty git credential subset when nothing is stored', async () => {
+    const res = await request(app).get('/api/git/credentials')
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ exists: false, providers: [], unlocked: false, stored: {} })
+  })
+
+  it('rejects git providers on /api/cloud/login (no OAuth for git)', async () => {
+    for (const provider of ['github', 'gitlab']) {
+      const res = await request(app).post('/api/cloud/login').send({ provider })
+      expect(res.status).toBe(400)
+      expect(res.body.error).toContain('push/pull/fetch')
+    }
+  })
+
+  it('creates the store with git credentials, encrypted at rest', async () => {
+    const res = await request(app).post('/api/cloud/credentials').send({
+      action: 'create',
+      passphrase: PASS,
+      credentials: {
+        github: { username: 'octo', token: GH_TOKEN, host: '' },
+        gitlab: { username: 'gl-user', token: GL_TOKEN, host: 'gitlab.example.com' },
+      },
+    })
+    expect(res.status).toBe(200)
+    expect(res.body.exists).toBe(true)
+    expect([...res.body.providers].sort()).toEqual(['github', 'gitlab'])
+    // create leaves the store unlocked so a test can run immediately.
+    expect(res.body.unlocked).toBe(true)
+    expect(JSON.stringify(res.body)).not.toContain(GH_TOKEN)
+
+    const raw = fs.readFileSync(storeFile(), 'utf-8')
+    expect(raw).not.toContain(GH_TOKEN)
+    expect(raw).not.toContain(GL_TOKEN)
+
+    // Non-secret git metadata is persisted in the file's meta (visible while
+    // locked and across restarts); tokens stay inside the ciphertext.
+    const parsed = JSON.parse(raw)
+    expect(parsed.meta.git.github).toEqual({ username: 'octo', host: 'github.com', hasToken: true })
+    expect(parsed.meta.git.gitlab).toEqual({ username: 'gl-user', host: 'gitlab.example.com', hasToken: true })
+  })
+
+  it('reports git providers + stored metadata without secrets', async () => {
+    const res = await request(app).get('/api/git/credentials')
+    expect(res.status).toBe(200)
+    expect(res.body.exists).toBe(true)
+    expect([...res.body.providers].sort()).toEqual(['github', 'gitlab'])
+    expect(res.body.unlocked).toBe(true)
+
+    // Metadata stays readable while locked (and across restarts): no secrets.
+    await request(app).post('/api/cloud/credentials').send({ action: 'lock' })
+    const locked = await request(app).get('/api/git/credentials')
+    expect(locked.body.unlocked).toBe(false)
+    expect(locked.body.stored.github).toEqual({ username: 'octo', host: 'github.com', hasToken: true })
+    expect(JSON.stringify(locked.body)).not.toContain(GH_TOKEN)
+  })
+
+  it('backfills git metadata on unlock for legacy stores (no meta.git)', async () => {
+    // Simulate a store written before meta.git existed: strip the key from disk.
+    const raw = JSON.parse(fs.readFileSync(storeFile(), 'utf-8'))
+    delete raw.meta.git
+    fs.writeFileSync(storeFile(), JSON.stringify(raw))
+
+    await request(app).post('/api/cloud/credentials').send({ action: 'unlock', passphrase: PASS })
+    const after = JSON.parse(fs.readFileSync(storeFile(), 'utf-8'))
+    expect(after.meta.git.github.username).toBe('octo')
+    expect(after.meta.git.gitlab.host).toBe('gitlab.example.com')
+  })
+
+  it('push injects askpass env only while the store is unlocked', async () => {
+    const d = path.join(root, 'git-creds-repo')
+    fs.mkdirSync(path.join(d, '.git'), { recursive: true })
+
+    await request(app).post('/api/cloud/credentials').send({ action: 'unlock', passphrase: PASS })
+    let res = await request(app).post('/api/git/push').send({ path: d })
+    expect(res.status).toBe(200)
+    expect(res.body.success).toBe(true)
+
+    // Each push/pull/fetch records exactly 6 lines; group them into blocks.
+    const readEnvLog = () => {
+      const lines = fs.readFileSync(path.join(d, '.git', 'env-log'), 'utf-8').trim().split('\n')
+      const blocks = []
+      for (let i = 0; i < lines.length; i += 6) {
+        blocks.push(Object.fromEntries(lines.slice(i, i + 6).map((l) => l.split('='))))
+      }
+      return blocks
+    }
+    let envs = readEnvLog()
+    expect(envs).toHaveLength(1)
+    const unlocked = envs[0]
+    expect(unlocked.GIT_TERMINAL_PROMPT).toBe('0')
+    expect(unlocked.TC_GH_HOST).toBe('github.com')
+    expect(unlocked.TC_GH_USER).toBe('octo')
+    expect(unlocked.TC_GH_TOKEN).toBe(GH_TOKEN)
+    expect(unlocked.TC_GL_HOST).toBe('gitlab.example.com')
+    expect(unlocked.GIT_ASKPASS).not.toBe('')
+    expect(fs.existsSync(unlocked.GIT_ASKPASS)).toBe(true)
+
+    await request(app).post('/api/cloud/credentials').send({ action: 'lock' })
+    res = await request(app).post('/api/git/push').send({ path: d })
+    expect(res.status).toBe(200)
+
+    envs = readEnvLog()
+    expect(envs).toHaveLength(2)
+    const locked = envs[1]
+    expect(locked.GIT_TERMINAL_PROMPT).toBe('0')
+    expect(locked.TC_GH_HOST).toBe('')
+    expect(locked.TC_GH_TOKEN).toBe('')
+    expect(locked.GIT_ASKPASS).toBe('')
+  })
+
+  it('tests inline credentials against the provider user API', async () => {
+    const calls = []
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (url, opts) => {
+      calls.push({ url: String(url), headers: opts?.headers ?? {} })
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ login: 'octo' }) })
+    }
+    try {
+      const res = await request(app).post('/api/git/credentials/test').send({ provider: 'github', token: 'inline-tok' })
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ ok: true, provider: 'github', host: 'github.com', identity: 'octo' })
+      // github.com's API lives on api.github.com — /api/v3 on the web host 404s.
+      expect(calls[0].url).toBe('https://api.github.com/user')
+      expect(calls[0].headers.Authorization).toBe('Bearer inline-tok')
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  it('uses /api/v3 on the instance host for self-hosted GitHub', async () => {
+    const calls = []
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (url) => {
+      calls.push(String(url))
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ login: 'ghe' }) })
+    }
+    try {
+      const res = await request(app).post('/api/git/credentials/test').send({ provider: 'github', token: 't', host: 'ghe.example.com' })
+      expect(res.status).toBe(200)
+      expect(calls[0]).toBe('https://ghe.example.com/api/v3/user')
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  it('tests stored gitlab credentials with the PRIVATE-TOKEN header', async () => {
+    await request(app).post('/api/cloud/credentials').send({ action: 'unlock', passphrase: PASS })
+    const calls = []
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (url, opts) => {
+      calls.push({ url: String(url), headers: opts?.headers ?? {} })
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ username: 'gl-user' }) })
+    }
+    try {
+      const res = await request(app).post('/api/git/credentials/test').send({ provider: 'gitlab' })
+      expect(res.status).toBe(200)
+      expect(res.body.identity).toBe('gl-user')
+      expect(res.body.host).toBe('gitlab.example.com')
+      expect(calls[0].url).toBe('https://gitlab.example.com/api/v4/user')
+      expect(calls[0].headers['PRIVATE-TOKEN']).toBe(GL_TOKEN)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  it('maps an upstream auth rejection to a clean 401', async () => {
+    const realFetch = globalThis.fetch
+    globalThis.fetch = () => Promise.resolve({ ok: false, status: 401, json: () => Promise.reject(new Error('no body')) })
+    try {
+      const res = await request(app).post('/api/git/credentials/test').send({ provider: 'github', token: 'bad-tok' })
+      expect(res.status).toBe(401)
+      expect(res.body.error).toContain('Authentication rejected by GitHub')
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  it('requires the store to be unlocked when testing stored credentials', async () => {
+    await request(app).post('/api/cloud/credentials').send({ action: 'lock' })
+    const res = await request(app).post('/api/git/credentials/test').send({ provider: 'github' })
+    expect(res.status).toBe(401)
+    expect(res.body.error).toContain('unlock the store')
+  })
+
+  it('rejects an unknown provider on the test endpoint', async () => {
+    const res = await request(app).post('/api/git/credentials/test').send({ provider: 'bitbucket' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toContain('github, gitlab')
+  })
+
+  it('askpass script answers username/password prompts per host', async () => {
+    const script = serverModule.ensureGitAskpassScript()
+    const env = { PATH: process.env.PATH, TC_GH_HOST: 'github.com', TC_GH_USER: 'octo', TC_GH_TOKEN: GH_TOKEN }
+    const run = (prompt) =>
+      new Promise((resolve) => {
+        execFile('sh', [script, prompt], { env }, (err, stdout) => resolve({ code: err ? Number(err.code) : 0, out: String(stdout).trim() }))
+      })
+
+    expect((await run("Username for 'https://github.com': ")).out).toBe('octo')
+    expect((await run('Password for "octo@github.com": ')).out).toBe(GH_TOKEN)
+    expect((await run('Password for "https://github.com": ')).out).toBe(GH_TOKEN)
+    // Regression: git embeds the answered username in the URL — the host must
+    // still be parsed from user@host, not captured as the userinfo.
+    expect((await run("Password for 'https://octo@github.com': ")).out).toBe(GH_TOKEN)
+    expect((await run("Username for 'https://octo@github.com': ")).out).toBe('octo')
+    const other = await run("Username for 'https://gitlab.com': ")
+    expect(other.code).toBe(1)
+  })
+
+  it('cleans up the store', async () => {
+    const res = await request(app).post('/api/cloud/credentials').send({ action: 'delete', passphrase: PASS })
+    expect(res.status).toBe(200)
+    const status = await request(app).get('/api/git/credentials')
+    expect(status.body.exists).toBe(false)
   })
 })

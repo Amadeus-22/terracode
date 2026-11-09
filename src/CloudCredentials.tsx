@@ -171,7 +171,7 @@ const CloudCredentials = (): ReactElement => {
   const handleDelete = async () => {
     if (busy || pass1 === '') return
     const ok = window.confirm(
-      'Delete the registered cloud credentials? All active logins end and terraform runs stop receiving them.',
+      'Delete the entire credential store, including any Git (GitHub/GitLab) credentials? All active cloud logins end and terraform runs stop receiving them.',
     )
     if (!ok) return
     const done = await act('delete', { passphrase: pass1 })
@@ -188,7 +188,9 @@ const CloudCredentials = (): ReactElement => {
     )
   }
 
-  const configured = status?.providers ?? []
+  // The shared store can also hold git providers (github/gitlab); those are
+  // managed in the Git credentials section, so only cloud ones appear here.
+  const configured = (status?.providers ?? []).filter((p): p is CloudProvider => Object.hasOwn(CLOUD_PROVIDER_LABELS, p))
   const showForm = mode === 'register' || mode === 'edit'
   const isEdit = mode === 'edit'
 
@@ -225,6 +227,17 @@ const CloudCredentials = (): ReactElement => {
               {CLOUD_PROVIDER_LABELS[p]}
             </span>
           ))}
+          {status.unlocked && status.details && configured.map(p => {
+            const d = status.details?.[p]
+            if (!d) return null
+            const parts = Object.values(d).filter(v => v !== '')
+            if (parts.length === 0) return null
+            return (
+              <p key={`detail-${p}`} className="tf-status">
+                {CLOUD_PROVIDER_LABELS[p]}: {parts.join(' · ')}
+              </p>
+            )
+          })}
           {!status.unlocked && (
             <div className="tf-creds-row">
               <input

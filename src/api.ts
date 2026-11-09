@@ -171,33 +171,8 @@ export type TfChangedFile = {
   after: string
 }
 
-export type TfDiagnostic = {
-  severity?: 'error' | 'warning'
-  summary: string
-  detail?: string
-}
-
-// One attribute-level change inside a planned resource (plan deep-dive).
-// `after` is null with unknown:true when the value is only known after apply.
-export type TfAttributeChange = {
-  path: string
-  before: unknown
-  after: unknown
-  unknown?: boolean
-}
-
-export type TfPlanResource = {
-  address: string
-  type: string
-  name: string
-  actions: string[]
-  // Attribute diffs for this resource; absent on older server responses.
-  changes?: TfAttributeChange[]
-}
-
+// Per-action counts parsed from a text-mode plan (see parsePlanText server-side).
 export type TfPlanSummary = { add: number; update: number; replace: number; destroy: number }
-
-export type TfOutputValue = { value: unknown; type?: string; sensitive?: boolean }
 
 // One node of the configuration dependency graph (terraform graph).
 export type TfGraphNode = { id: string; label?: string }
@@ -206,7 +181,6 @@ export type TfCommand =
   | 'fmt'
   | 'validate'
   | 'plan'
-  | 'plan-json'
   | 'drift'
   | 'graph'
   | 'init'
@@ -244,20 +218,14 @@ export type TfWorkspace = { name: string; current: boolean }
 
 export type TfRunResult =
   | { command: 'fmt'; exitCode: number; changedFiles: TfChangedFile[]; error?: string }
+  | { command: 'validate'; exitCode: number | null; timedOut: boolean; output: string }
   | {
-      command: 'validate'
-      valid: boolean
-      errorCount: number
-      warningCount: number
-      diagnostics: TfDiagnostic[]
-    }
-  | { command: 'plan'; exitCode: number | null; output: string; timedOut: boolean }
-  | {
-      command: 'plan-json'
+      // Text-mode plan. summary is parsed from the per-resource header lines
+      // (null when the run errored before printing any summary).
+      command: 'plan'
       exitCode: number | null
       timedOut: boolean
       summary: TfPlanSummary | null
-      resources: TfPlanResource[]
       output: string
     }
   | {
@@ -269,7 +237,6 @@ export type TfRunResult =
       timedOut: boolean
       drifted: boolean | null
       summary: TfPlanSummary | null
-      resources: TfPlanResource[]
       output: string
     }
   | {
@@ -283,13 +250,7 @@ export type TfRunResult =
     }
   | { command: 'init'; exitCode: number | null; output: string; timedOut: boolean }
   | { command: 'init-upgrade'; exitCode: number | null; output: string; timedOut: boolean }
-  | {
-      command: 'output'
-      exitCode: number | null
-      timedOut: boolean
-      outputs: Record<string, TfOutputValue> | null
-      output: string
-    }
+  | { command: 'output'; exitCode: number | null; timedOut: boolean; output: string }
   | { command: 'state-list'; exitCode: number | null; timedOut: boolean; addresses: string[]; output: string }
   | { command: 'state-show'; exitCode: number | null; timedOut: boolean; address: string; output: string }
   | { command: 'version'; exitCode: number | null; timedOut: boolean; version: string | null; platform: string | null; output: string }
@@ -534,19 +495,36 @@ export const CLOUD_PROVIDER_LABELS: Record<CloudProvider, string> = {
   gcp: 'Google Cloud'
 }
 
+export type GitCredProvider = 'github' | 'gitlab'
+
+export const GIT_CRED_PROVIDER_LABELS: Record<GitCredProvider, string> = {
+  github: 'GitHub',
+  gitlab: 'GitLab'
+}
+
 export type CloudCredentialsPayload = {
   aws?: { accessKeyId: string; secretAccessKey: string; sessionToken: string; region: string }
   azure?: { clientId: string; clientSecret: string; tenantId: string; subscriptionId: string }
   gcp?: { serviceAccountJson: string; projectId: string }
+  github?: { username: string; token: string; host: string }
+  gitlab?: { username: string; token: string; host: string }
 }
 
 export type CloudSession = { loggedInAt: number; identity: string } & Record<string, unknown>
 
+// `providers` may include git providers (github/gitlab) — they share the same
+// encrypted store but are managed from Settings → Git credentials.
 export type CloudStatus = {
   exists: boolean
-  providers: CloudProvider[]
+  providers: string[]
   unlocked: boolean
   sessions: Partial<Record<CloudProvider, CloudSession>>
+  // Non-secret identifiers, present only while the store is unlocked.
+  details?: {
+    aws?: { accessKeyId: string; region: string }
+    azure?: { tenantId: string; subscriptionId: string }
+    gcp?: { projectId: string }
+  }
 }
 
 export function getCloudStatus(): Promise<CloudStatus> {
@@ -593,6 +571,43 @@ export function cloudLogout(provider: CloudProvider): Promise<{ ok: true; provid
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ provider })
+  })
+}
+
+// --- Git credentials (same global encrypted store as the cloud ones) ---------
+// GitHub/GitLab username + personal access token, stored per provider with an
+// optional self-hosted instance host. While the store is unlocked, git
+// push/pull/fetch authenticate against matching hosts automatically; machine
+// auth (SSH keys, system helpers) always takes precedence when it works.
+
+// Non-secret identifiers persisted in the store file's metadata — visible even
+// while locked and across restarts. Tokens never leave the ciphertext.
+export type GitCredStoredInfo = { username: string; host: string; hasToken: boolean }
+
+export type GitCredentialStatus = {
+  exists: boolean
+  providers: string[]
+  unlocked: boolean
+  stored?: Partial<Record<GitCredProvider, GitCredStoredInfo>>
+}
+
+export function getGitCredentialStatus(): Promise<GitCredentialStatus> {
+  return request<GitCredentialStatus>(`${API_BASE}/api/git/credentials`)
+}
+
+export type GitCredTestResult = { ok: true; provider: GitCredProvider; host: string; identity: string }
+
+// Verify credentials against the provider's own user API. Inline fields test
+// values before saving; omit them to test the stored entry (store unlocked).
+export function testGitCredentials(
+  provider: GitCredProvider,
+  inline?: { username: string; token: string; host: string },
+): Promise<{ ok: boolean; provider: string; host?: string; identity?: string }> {
+  const body = inline ? { provider, ...inline } : { provider }
+  return request<{ ok: boolean; provider: string; host?: string; identity?: string }>(`${API_BASE}/api/git/credentials/test`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
   })
 }
 

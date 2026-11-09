@@ -95,7 +95,7 @@ const CloudLogin = ({ onClose }: CloudLoginProps): ReactElement => {
           )}
 
           <div className="cloud-login-list">
-            {status.providers.map(provider => {
+            {status.providers.filter((p): p is CloudProvider => Object.hasOwn(CLOUD_PROVIDER_LABELS, p)).map(provider => {
               const session = status.sessions[provider]
               const busy = busyProvider === provider
               return (

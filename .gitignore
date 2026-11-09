@@ -37,4 +37,7 @@ __pycache__/
 release/
 
 # kilo
-kilo
+.kilo/skills/skill.md
+.kilo/spec/spec.md
+.gitignore
+.kilo/test/test.md
