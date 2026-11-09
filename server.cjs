@@ -746,12 +746,12 @@ const TF_COMMANDS = {
   // Dependency graph of the configuration (DOT on stdout). Read-only.
   graph: ['graph', '-no-color'],
   init: ['init', '-input=false', '-no-color'],
-  output: ['output', '-json'],
+  output: ['output', '-no-color'],
   'state-list': ['state', 'list', '-no-color'],
   // Guarded apply flow, see TF_PLAN_FILE above.
   'plan-file': ['plan', '-input=false', '-no-color', `-out=${TF_PLAN_FILE}`],
   apply: ['apply', '-input=false', '-no-color', TF_PLAN_FILE],
-  version: ['version', '-json'],
+  version: ['version', '-no-color'],
   'init-upgrade': ['init', '-input=false', '-no-color', '-upgrade'],
   'workspace-list': ['workspace', 'list', '-no-color'],
   // Inspect the saved execution plan (terraform show tfplan).

@@ -61,8 +61,13 @@ case "$1" in
     exit 0
     ;;
   output)
-    echo 'env = "prod"'
-    echo 'secret_key = (sensitive value)'
+    # Honor -json so a server-side regression to JSON mode fails the text assertions.
+    if [ "$2" = "-json" ]; then
+      printf '%s\n' '{"env":{"value":"prod","type":"string","sensitive":false},"secret_key":{"value":"hidden-value","type":"string","sensitive":true}}'
+    else
+      echo 'env = "prod"'
+      echo 'secret_key = (sensitive value)'
+    fi
     exit 0
     ;;
   state)
@@ -128,8 +133,13 @@ case "$1" in
     exit 0
     ;;
   version)
-    echo 'Terraform v1.9.8'
-    echo 'on linux_amd64'
+    # Honor -json so a server-side regression to JSON mode fails the text assertions.
+    if [ "$2" = "-json" ]; then
+      printf '%s\n' '{"terraform_version":"1.9.8","platform":"linux_amd64"}'
+    else
+      echo 'Terraform v1.9.8'
+      echo 'on linux_amd64'
+    fi
     exit 0
     ;;
   workspace)
