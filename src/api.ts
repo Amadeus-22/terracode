@@ -227,6 +227,7 @@ export type TfRunResult =
       timedOut: boolean
       summary: TfPlanSummary | null
       output: string
+      previewId: string | null
     }
   | {
       // Drift check (plan -detailed-exitcode): drifted is false when state
@@ -271,6 +272,14 @@ export function runTerraform(command: TfCommand, dirPath: string, opts?: TfRunOp
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ command, path: dirPath, ...opts })
+  })
+}
+
+export function getTerraformPlanJson(dirPath: string, previewId: string): Promise<{ rawJson: string }> {
+  return request<{ rawJson: string }>(`${API_BASE}/api/tf/plan-json`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: dirPath, previewId })
   })
 }
 
@@ -503,11 +512,11 @@ export const GIT_CRED_PROVIDER_LABELS: Record<GitCredProvider, string> = {
 }
 
 export type CloudCredentialsPayload = {
-  aws?: { accessKeyId: string; secretAccessKey: string; sessionToken: string; region: string }
-  azure?: { clientId: string; clientSecret: string; tenantId: string; subscriptionId: string }
-  gcp?: { serviceAccountJson: string; projectId: string }
-  github?: { username: string; token: string; host: string }
-  gitlab?: { username: string; token: string; host: string }
+  aws?: { accessKeyId?: string; secretAccessKey?: string; sessionToken?: string; region?: string }
+  azure?: { clientId?: string; clientSecret?: string; tenantId?: string; subscriptionId?: string }
+  gcp?: { serviceAccountJson?: string; projectId?: string }
+  github?: { username?: string; token?: string; host?: string }
+  gitlab?: { username?: string; token?: string; host?: string }
 }
 
 export type CloudSession = { loggedInAt: number; identity: string } & Record<string, unknown>
@@ -518,11 +527,12 @@ export type CloudStatus = {
   exists: boolean
   providers: string[]
   unlocked: boolean
+  unlockedUntil?: number
   sessions: Partial<Record<CloudProvider, CloudSession>>
   // Non-secret identifiers, present only while the store is unlocked.
   details?: {
-    aws?: { accessKeyId: string; region: string }
-    azure?: { tenantId: string; subscriptionId: string }
+    aws?: { accessKeyId: string; region: string; hasSecretAccessKey: boolean; hasSessionToken: boolean }
+    azure?: { clientId: string; tenantId: string; subscriptionId: string }
     gcp?: { projectId: string }
   }
 }
@@ -533,9 +543,15 @@ export function getCloudStatus(): Promise<CloudStatus> {
 
 export type CloudCredActionResult = { ok: true } & CloudStatus
 
+export const CREDENTIALS_CHANGED_EVENT = 'terracode:credentials-changed'
+
+function notifyCredentialChange(): void {
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event(CREDENTIALS_CHANGED_EVENT))
+}
+
 // action + fields are validated server-side; passphrases travel only over the
 // localhost API and are never stored or logged by the server.
-export function cloudCredentialAction(
+export async function cloudCredentialAction(
   action: 'create' | 'update' | 'change-passphrase' | 'unlock' | 'lock' | 'delete',
   payload?: {
     passphrase?: string
@@ -546,11 +562,13 @@ export function cloudCredentialAction(
     removeProviders?: string[]
   },
 ): Promise<CloudCredActionResult> {
-  return request<CloudCredActionResult>(`${API_BASE}/api/cloud/credentials`, {
+  const result = await request<CloudCredActionResult>(`${API_BASE}/api/cloud/credentials`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action, ...payload })
   })
+  notifyCredentialChange()
+  return result
 }
 
 // Authenticate against a cloud provider using the registered credentials. The
@@ -558,20 +576,24 @@ export function cloudCredentialAction(
 // unlocks the store first when it is locked.
 export type CloudLoginResult = { ok: true; provider: CloudProvider; session: CloudSession }
 
-export function cloudLogin(provider: CloudProvider, passphrase?: string): Promise<CloudLoginResult> {
-  return request<CloudLoginResult>(`${API_BASE}/api/cloud/login`, {
+export async function cloudLogin(provider: CloudProvider, passphrase?: string): Promise<CloudLoginResult> {
+  const result = await request<CloudLoginResult>(`${API_BASE}/api/cloud/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ provider, ...(passphrase ? { passphrase } : {}) })
   })
+  notifyCredentialChange()
+  return result
 }
 
-export function cloudLogout(provider: CloudProvider): Promise<{ ok: true; provider: CloudProvider }> {
-  return request<{ ok: true; provider: CloudProvider }>(`${API_BASE}/api/cloud/logout`, {
+export async function cloudLogout(provider: CloudProvider): Promise<{ ok: true; provider: CloudProvider }> {
+  const result = await request<{ ok: true; provider: CloudProvider }>(`${API_BASE}/api/cloud/logout`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ provider })
   })
+  notifyCredentialChange()
+  return result
 }
 
 // --- Git credentials (same global encrypted store as the cloud ones) ---------
@@ -588,6 +610,7 @@ export type GitCredentialStatus = {
   exists: boolean
   providers: string[]
   unlocked: boolean
+  unlockedUntil?: number
   stored?: Partial<Record<GitCredProvider, GitCredStoredInfo>>
 }
 

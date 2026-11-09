@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type ReactElement } from 'react'
-import { CLOUD_PROVIDER_LABELS, cloudLogin, cloudLogout, getCloudStatus, type CloudProvider, type CloudStatus } from './api'
+import { CLOUD_PROVIDER_LABELS, CREDENTIALS_CHANGED_EVENT, cloudLogin, cloudLogout, getCloudStatus, type CloudProvider, type CloudStatus } from './api'
 
 type CloudLoginProps = {
   onClose?: () => void
@@ -21,14 +21,26 @@ const CloudLogin = ({ onClose }: CloudLoginProps): ReactElement => {
 
   useEffect(() => {
     refresh()
+    window.addEventListener(CREDENTIALS_CHANGED_EVENT, refresh)
+    window.addEventListener('focus', refresh)
+    return () => {
+      window.removeEventListener(CREDENTIALS_CHANGED_EVENT, refresh)
+      window.removeEventListener('focus', refresh)
+    }
   }, [refresh])
+
+  useEffect(() => {
+    if (!status?.unlockedUntil) return
+    const timer = window.setTimeout(refresh, Math.max(1, status.unlockedUntil - Date.now() + 50))
+    return () => window.clearTimeout(timer)
+  }, [refresh, status?.unlockedUntil])
 
   const handleLogin = async (provider: CloudProvider) => {
     if (busyProvider !== null || status === null) return
     setBusyProvider(provider)
     setFeedback(f => f.filter(x => x.provider !== provider))
     try {
-      const res = await cloudLogin(provider, passphrase.trim() !== '' ? passphrase.trim() : undefined)
+      const res = await cloudLogin(provider, passphrase !== '' ? passphrase : undefined)
       setStatus(s => (s ? { ...s, unlocked: true, sessions: { ...s.sessions, [provider]: res.session } } : s))
       setPassphrase('')
       setFeedback(f => [{ provider, ok: true, text: `Logged in as ${res.session.identity}` }, ...f.filter(x => x.provider !== provider)])

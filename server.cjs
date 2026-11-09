@@ -12,6 +12,7 @@ const chokidar = require('chokidar');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
+const net = require('net');
 const os = require('os');
 const path = require('path');
 
@@ -848,6 +849,31 @@ function isValidConsoleExpression(expr) {
 const TF_TIMEOUT_MS = Number(process.env.TF_TIMEOUT_MS) || 120_000;
 const TF_MAX_FILES = 100; // cap on .tf files scanned for fmt before/after capture
 const tfRunning = new Set(); // real dir paths with an in-flight command
+const TF_PREVIEW_TTL_MS = 5 * 60_000;
+const TF_PREVIEW_MAX_BYTES = 16 * 1024 * 1024;
+const TF_PREVIEW_MAX_COUNT = 4;
+const tfPreviews = new Map();
+
+// Keep a short-lived plan in server memory so JSON represents the same plan as
+// the text. The temporary file is private and is removed immediately after use.
+function rememberTfPreview(dir, file) {
+  try {
+    if (fs.statSync(file).size > TF_PREVIEW_MAX_BYTES) return null;
+    const bytes = fs.readFileSync(file);
+    while (tfPreviews.size >= TF_PREVIEW_MAX_COUNT) {
+      const first = tfPreviews.keys().next().value;
+      clearTimeout(tfPreviews.get(first).timer);
+      tfPreviews.delete(first);
+    }
+    const id = crypto.randomBytes(16).toString('hex');
+    const timer = setTimeout(() => tfPreviews.delete(id), TF_PREVIEW_TTL_MS);
+    timer.unref();
+    tfPreviews.set(id, { dir, bytes, expiresAt: Date.now() + TF_PREVIEW_TTL_MS, timer });
+    return id;
+  } catch {
+    return null;
+  }
+}
 const TF_MAX_STATE_ADDRESSES = 1000;
 
 // Terraform resource address, e.g. aws_instance.web or module.vpc.aws_subnet.private[0].
@@ -874,19 +900,21 @@ function parsePlanText(stdout) {
   let sawHeader = false;
   for (const line of stdout.split('\n')) {
     let action = null;
-    if (/^\s*#\s+\S+ will be created\s*$/.test(line)) action = 'add';
-    else if (/^\s*#\s+\S+ will be updated in-place\s*$/.test(line)) action = 'update';
-    else if (/^\s*#\s+\S+ must be replaced\s*$/.test(line)) action = 'replace';
-    else if (/^\s*#\s+\S+ will be destroyed\s*$/.test(line)) action = 'destroy';
+    if (/^\s*#\s+.+ will be created\s*$/.test(line)) action = 'add';
+    else if (/^\s*#\s+.+ will be updated in-place\s*$/.test(line)) action = 'update';
+    else if (/^\s*#\s+.+ must be replaced\s*$/.test(line)) action = 'replace';
+    else if (/^\s*#\s+.+ will be destroyed\s*$/.test(line)) action = 'destroy';
     if (action !== null) {
       summary[action] += 1;
       sawHeader = true;
     }
   }
-  if (sawHeader) return summary;
-  if (/No changes\./.test(stdout)) return { add: 0, update: 0, replace: 0, destroy: 0 };
   const m = stdout.match(/^Plan: (\d+) to add, (\d+) to change, (\d+) to destroy\./m);
+  if (sawHeader && (!m || (summary.add + summary.replace === Number(m[1]) &&
+      summary.update === Number(m[2]) && summary.destroy + summary.replace === Number(m[3])))) return summary;
   if (m) return { add: Number(m[1]), update: Number(m[2]), replace: 0, destroy: Number(m[3]) };
+  if (sawHeader) return summary;
+  if (/^No changes\./m.test(stdout)) return { add: 0, update: 0, replace: 0, destroy: 0 };
   return null;
 }
 
@@ -988,7 +1016,7 @@ function parseTfVersions(output) {
 //   { error: 'enoent' | message, ... } when the binary cannot be started
 // When onChunk is given it receives each raw stdout/stderr chunk as it arrives.
 // When stdin (a string) is given it is written to the child's stdin and closed.
-function spawnCaptured(file, args, cwd, timeoutMs, env = process.env, onChunk, stdin) {
+function spawnCaptured(file, args, cwd, timeoutMs, env = process.env, onChunk, stdin, maxBytes = Infinity) {
   return new Promise(resolve => {
     let settled = false;
     const finish = (result) => {
@@ -1000,6 +1028,8 @@ function spawnCaptured(file, args, cwd, timeoutMs, env = process.env, onChunk, s
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let tooLarge = false;
+    let outputBytes = 0;
     let child;
     try {
       child = spawn(file, args, { cwd, env });
@@ -1016,15 +1046,26 @@ function spawnCaptured(file, args, cwd, timeoutMs, env = process.env, onChunk, s
       timedOut = true;
       child.kill('SIGKILL');
     }, timeoutMs);
-    child.stdout.on('data', d => { const s = d.toString(); stdout += s; if (onChunk) onChunk(s); });
-    child.stderr.on('data', d => { const s = d.toString(); stderr += s; if (onChunk) onChunk(s); });
+    const capture = (d, isStderr) => {
+      outputBytes += d.length;
+      if (outputBytes > maxBytes) {
+        tooLarge = true;
+        child.kill('SIGKILL');
+        return;
+      }
+      const s = d.toString();
+      if (isStderr) stderr += s; else stdout += s;
+      if (onChunk) onChunk(s);
+    };
+    child.stdout.on('data', d => capture(d, false));
+    child.stderr.on('data', d => capture(d, true));
     child.on('error', err => {
       clearTimeout(timer);
       finish({ error: err.code === 'ENOENT' ? 'enoent' : err.message, timedOut: false, stdout, stderr });
     });
     child.on('close', code => {
       clearTimeout(timer);
-      finish({ exitCode: code, timedOut, stdout, stderr });
+      finish({ ...(tooLarge ? { error: 'output-too-large' } : {}), exitCode: code, timedOut, stdout, stderr });
     });
   });
 }
@@ -1033,13 +1074,13 @@ function spawnCaptured(file, args, cwd, timeoutMs, env = process.env, onChunk, s
 // onChunk (optional) receives raw stdout/stderr chunks as it arrives; stdin
 // (optional string) is piped to the process (used by console-eval); extraEnv
 // (optional object) adds per-run environment variables (cloud credentials).
-function runTerraform(cwd, args, onChunk, stdin, extraEnv) {
+function runTerraform(cwd, args, onChunk, stdin, extraEnv, maxBytes) {
   const binDir = tfenvBinDir();
   const baseEnv = binDir
     ? { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}` }
     : process.env;
   const env = extraEnv && Object.keys(extraEnv).length > 0 ? { ...baseEnv, ...extraEnv } : baseEnv;
-  return spawnCaptured('terraform', args, cwd, TF_TIMEOUT_MS, env, onChunk, stdin);
+  return spawnCaptured('terraform', args, cwd, TF_TIMEOUT_MS, env, onChunk, stdin, maxBytes);
 }
 
 // Run a tfenv subcommand (list / version-name / install) and resolve with output.
@@ -1105,6 +1146,15 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
 
   const args = buildTfArgs(command, opts);
   const stdin = command === 'console-eval' ? `${opts.expression}\n` : undefined;
+  let previewDir = null;
+  if (command === 'plan') {
+    try {
+      previewDir = fs.mkdtempSync(path.join(os.tmpdir(), 'terracode-plan-'));
+      args.push(`-out=${path.join(previewDir, 'plan')}`);
+    } catch {
+      return { statusCode: 500, body: { error: 'Could not prepare a private plan preview' } };
+    }
+  }
 
   // Inject cloud credentials as environment variables for this run only. Only
   // providers with an active login session are included (see the credential
@@ -1114,7 +1164,16 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
     setCredUnlock(credUnlockedPayload); // refresh on use
   }
 
-  const result = await runTerraform(dir, args, onChunk, stdin, Object.keys(credEnv).length > 0 ? credEnv : undefined);
+  let result;
+  let previewId = null;
+  try {
+    result = await runTerraform(dir, args, onChunk, stdin, Object.keys(credEnv).length > 0 ? credEnv : undefined);
+    if (previewDir && !result.error && !result.timedOut && result.exitCode === 0) {
+      previewId = rememberTfPreview(dir, path.join(previewDir, 'plan'));
+    }
+  } finally {
+    if (previewDir) fs.rmSync(previewDir, { recursive: true, force: true });
+  }
   if (result.error === 'enoent') {
     return { statusCode: 503, body: { error: 'terraform executable not found in PATH' } };
   }
@@ -1155,7 +1214,7 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
     if (command === 'plan') {
       return {
         statusCode: 200,
-        body: { command: 'plan', exitCode, timedOut: result.timedOut, summary: parsed, output: tfOutputText(result) },
+        body: { command: 'plan', exitCode, timedOut: result.timedOut, summary: parsed, output: tfOutputText(result), previewId },
       };
     }
     // -detailed-exitcode: 0 = state matches reality, 2 = changes detected.
@@ -1663,6 +1722,20 @@ const CRED_PROVIDERS = {
 // via GIT_ASKPASS — never by cloud logins or terraform env injection.
 const GIT_CRED_PROVIDERS = { github: 'github.com', gitlab: 'gitlab.com' };
 
+function gitCredentialMetadata(creds) {
+  const metadata = {};
+  for (const [provider, defaultHost] of Object.entries(GIT_CRED_PROVIDERS)) {
+    const entry = creds[provider];
+    if (!entry) continue;
+    metadata[provider] = {
+      username: typeof entry.username === 'string' ? entry.username : '',
+      host: typeof entry.host === 'string' && entry.host.trim() !== '' ? entry.host.trim().toLowerCase() : defaultHost,
+      hasToken: typeof entry.token === 'string' && entry.token !== '',
+    };
+  }
+  return metadata;
+}
+
 // Global store location (system settings scope, never inside a project).
 function credHomeDir() {
   return process.env.TF_CODE_CRED_DIR || path.join(os.homedir(), CRED_DIR_NAME);
@@ -1715,6 +1788,11 @@ function normalizeCredentials(raw, allowEmpty = false) {
       return { error: 'gcp.serviceAccountJson must be a valid service-account key (JSON object)' };
     }
   }
+  for (const provider of ['github', 'gitlab']) {
+    if (creds[provider]?.host && normalizeGitHost(creds[provider].host) === null) {
+      return { error: `${provider}.host must be a hostname with an optional port` };
+    }
+  }
   const providers = Object.keys(creds);
   if (providers.length === 0 && !allowEmpty) return { error: 'Provide at least one credential field' };
   return { creds, providers };
@@ -1744,16 +1822,7 @@ function encryptCredFile(creds, providers, passphrase) {
   const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   // Non-sensitive git identifiers (username/host only — never tokens) so the UI
   // can show what is stored without decrypting; survives restarts and lock state.
-  const gitMeta = {};
-  for (const [provider, defaultHost] of Object.entries(GIT_CRED_PROVIDERS)) {
-    const c = creds[provider];
-    if (!c) continue;
-    gitMeta[provider] = {
-      username: typeof c.username === 'string' ? c.username : '',
-      host: typeof c.host === 'string' && c.host.trim() !== '' ? c.host.trim().toLowerCase() : defaultHost,
-      hasToken: typeof c.token === 'string' && c.token !== '',
-    };
-  }
+  const gitMeta = gitCredentialMetadata(creds);
   return {
     v: 1,
     kdf: { name: 'scrypt', N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P },
@@ -1820,7 +1889,7 @@ let credUnlockExpiry = 0;
 
 function credUnlockEntry() {
   if (credUnlockedPayload === null) return null;
-  if (Date.now() > credUnlockExpiry) {
+  if (Date.now() >= credUnlockExpiry) {
     credUnlockedPayload = null; // lazy TTL expiry
     credUnlockExpiry = 0;
     return null;
@@ -2070,15 +2139,16 @@ app.get('/api/cloud/status', (req, res) => {
   if (unlocked) {
     const payload = credUnlockEntry();
     details = {};
-    if (payload.aws) details.aws = { accessKeyId: payload.aws.accessKeyId ?? '', region: payload.aws.region ?? '' };
-    if (payload.azure) details.azure = { tenantId: payload.azure.tenantId ?? '', subscriptionId: payload.azure.subscriptionId ?? '' };
+    if (payload.aws) details.aws = { accessKeyId: payload.aws.accessKeyId ?? '', region: payload.aws.region ?? '', hasSecretAccessKey: Boolean(payload.aws.secretAccessKey), hasSessionToken: Boolean(payload.aws.sessionToken) };
+    if (payload.azure) details.azure = { clientId: payload.azure.clientId ?? '', tenantId: payload.azure.tenantId ?? '', subscriptionId: payload.azure.subscriptionId ?? '' };
     if (payload.gcp) details.gcp = { projectId: payload.gcp.projectId ?? '' };
   }
   res.json({
     exists: fileObj !== null,
     providers: fileObj !== null && Array.isArray(fileObj.meta?.providers) ? fileObj.meta.providers : [],
     unlocked,
-    sessions: Object.fromEntries(cloudSessions),
+    sessions: unlocked ? Object.fromEntries(cloudSessions) : {},
+    ...(unlocked ? { unlockedUntil: credUnlockExpiry } : {}),
     ...(details ? { details } : {}),
   });
 });
@@ -2097,12 +2167,14 @@ app.post('/api/cloud/credentials', (req, res) => {
 
   const statusPayload = () => {
     const fileObj = readCredFile();
+    const unlocked = credUnlockEntry() !== null;
     return {
       ok: true,
       exists: fileObj !== null,
       providers: fileObj !== null && Array.isArray(fileObj.meta?.providers) ? fileObj.meta.providers : [],
-      unlocked: credUnlockEntry() !== null,
-      sessions: Object.fromEntries(cloudSessions),
+      unlocked,
+      sessions: unlocked ? Object.fromEntries(cloudSessions) : {},
+      ...(unlocked ? { unlockedUntil: credUnlockExpiry } : {}),
     };
   };
 
@@ -2113,6 +2185,7 @@ app.post('/api/cloud/credentials', (req, res) => {
     const existing = readCredFile();
 
     let next; // normalized credential payload to persist
+    let old = null;
     if (action === 'create') {
       if (existing !== null) {
         return res.status(409).json({ error: 'Cloud credentials are already registered — use update instead' });
@@ -2122,13 +2195,16 @@ app.post('/api/cloud/credentials', (req, res) => {
       next = normalized.creds;
     } else {
       if (existing === null) return res.status(404).json({ error: 'No cloud credentials are registered yet' });
-      const old = decryptCredPayload(existing, body.passphrase);
+      old = decryptCredPayload(existing, body.passphrase);
       if (old === null) return res.status(401).json({ error: 'Wrong passphrase' });
 
-      // Merge semantics: providers with filled-in fields replace their stored
-      // block; listed providers are removed; everything else is kept as-is.
-      const normalized = normalizeCredentials(body.credentials ?? {}, true);
-      if (normalized.error) return res.status(400).json({ error: normalized.error });
+      // Partial updates preserve omitted fields, including stored secrets.
+      const changes = body.credentials ?? {};
+      if (!isPlainObject(changes)) return res.status(400).json({ error: 'credentials must be an object' });
+      for (const provider of Object.keys(changes)) {
+        if (!Object.hasOwn(CRED_PROVIDERS, provider)) return res.status(400).json({ error: `Unknown credential provider "${provider}"` });
+        if (!isPlainObject(changes[provider])) return res.status(400).json({ error: `${provider} credentials must be an object` });
+      }
       next = { ...old };
       for (const provider of Object.keys(next)) {
         if (!Object.hasOwn(CRED_PROVIDERS, provider)) delete next[provider]; // drop unknown legacy keys
@@ -2140,9 +2216,11 @@ app.post('/api/cloud/credentials', (req, res) => {
         }
         delete next[p];
       }
-      for (const [provider, block] of Object.entries(normalized.creds)) next[provider] = block;
-      if (Object.keys(next).length === 0) {
-        return res.status(400).json({ error: 'At least one provider must remain — use delete to remove the whole store' });
+      for (const [provider, block] of Object.entries(changes)) {
+        if (removeList.includes(provider)) return res.status(400).json({ error: `Cannot update and remove ${provider} together` });
+        const normalized = normalizeCredentials({ [provider]: { ...(old[provider] ?? {}), ...block } }, true);
+        if (normalized.error) return res.status(400).json({ error: normalized.error });
+        if (normalized.creds[provider]) next[provider] = normalized.creds[provider];
       }
     }
 
@@ -2150,6 +2228,11 @@ app.post('/api/cloud/credentials', (req, res) => {
       writeCredFile(encryptCredFile(next, Object.keys(next), body.passphrase));
     } catch (err) {
       return res.status(500).json({ error: 'Failed to save credentials', details: err.message });
+    }
+    if (action === 'update') {
+      for (const provider of ['aws', 'azure', 'gcp']) {
+        if (JSON.stringify(old[provider]) !== JSON.stringify(next[provider])) cloudSessions.delete(provider);
+      }
     }
     // The caller just proved passphrase knowledge (or set a new one): leave the
     // store unlocked so immediate follow-ups — test, login, git push/pull/fetch —
@@ -2211,7 +2294,8 @@ app.post('/api/cloud/credentials', (req, res) => {
       return res.status(401).json({ error: 'Wrong passphrase' });
     }
     try {
-      fs.rmSync(credHomeDir(), { recursive: true, force: true });
+      fs.rmSync(credStorePath(), { force: true });
+      fs.rmSync(path.join(credHomeDir(), 'gcp-key.json'), { force: true });
     } catch (err) {
       return res.status(500).json({ error: 'Failed to delete credentials', details: err.message });
     }
@@ -2396,6 +2480,38 @@ app.post('/api/tf/run', (req, res) => {
     .finally(() => {
       tfRunning.delete(dir);
     });
+});
+
+// The raw JSON is requested explicitly: Terraform may include sensitive values.
+app.post('/api/tf/plan-json', async (req, res) => {
+  const body = req.body ?? {};
+  const id = typeof body.previewId === 'string' ? body.previewId : '';
+  if (!/^[a-f0-9]{32}$/.test(id)) return res.status(400).json({ error: 'Invalid plan preview' });
+  const dir = resolveTfDir(res, body.path);
+  if (!dir) return;
+  const preview = tfPreviews.get(id);
+  if (!preview || preview.dir !== dir || Date.now() >= preview.expiresAt) {
+    return res.status(404).json({ error: 'Plan preview expired — run Plan again' });
+  }
+  if (tfRunning.has(dir)) return res.status(409).json({ error: 'A terraform command is already running for this directory' });
+  tfRunning.add(dir);
+  let tempDir;
+  try {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'terracode-plan-'));
+    const file = path.join(tempDir, 'plan');
+    fs.writeFileSync(file, preview.bytes, { mode: 0o600 });
+    const result = await runTerraform(dir, ['show', '-json', file], undefined, undefined, undefined, TF_PREVIEW_MAX_BYTES);
+    if (result.error === 'output-too-large') return res.status(413).json({ error: 'Plan JSON exceeds the preview size limit' });
+    if (result.error || result.timedOut || result.exitCode !== 0) {
+      return res.status(result.timedOut ? 504 : 500).json({ error: 'Could not render the saved plan as JSON' });
+    }
+    try { JSON.parse(result.stdout); } catch { return res.status(500).json({ error: 'Terraform returned invalid plan JSON' }); }
+    res.set('Cache-Control', 'no-store');
+    return res.json({ rawJson: result.stdout });
+  } finally {
+    if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+    tfRunning.delete(dir);
+  }
 });
 
 // API endpoint: run a whitelisted terraform command and stream its output live.
@@ -2641,74 +2757,97 @@ function repoWebUrl(url) {
 }
 
 // --- Git credential injection -------------------------------------------------
-// Stored GitHub/GitLab credentials (from the global encrypted store) are handed
-// to git through GIT_ASKPASS for network operations only. The helper answers a
-// prompt only when its host matches a stored entry; anything else exits 1 so
-// git falls back to whatever machine-level auth already works (SSH keys, system
-// credential helpers). Secrets travel in the child process environment only —
-// never argv, never disk. GIT_TERMINAL_PROMPT=0 turns the old "could not read
-// Username ... Input/output error" into a clean failure when no auth applies.
+// Tokens stay in this process. A per-operation loopback broker with a random
+// capability serves askpass; Git and its hooks do not inherit tokens in env.
 
-const GIT_ASKPASS_SCRIPT = `#!/bin/sh
-# Normalize the prompt (quotes -> spaces) so host parsing never has to match
-# quote characters. Prompts look like:
-#   Username for 'https://github.com':
-#   Password for "octo@github.com":  /  Password for "https://paduartesre@github.com":
-clean=$(printf '%s\\n' "$1" | tr '\\047\\042' '  ')
-host=$(printf '%s\\n' "$clean" | sed -n 's/.*:\\/\\/\\([^ ]*\\).*$/\\1/p')
-if [ -z "$host" ]; then
-  host=$(printf '%s\\n' "$clean" | sed -n 's/.*@\\([^@ ]*\\).*/\\1/p')
-fi
-[ -n "$host" ] || exit 1
-# Drop userinfo when git embeds the answered username in the URL (user@host -> host).
-host=\${host##*@}
-case "$1" in
-  *assword*) want=token ;;
-  *) want=user ;;
-esac
-if [ -n "\${TC_GH_HOST:-}" ] && [ "$host" = "$TC_GH_HOST" ]; then
-  if [ "$want" = "token" ]; then [ -n "\${TC_GH_TOKEN:-}" ] || exit 1; printf '%s\\n' "$TC_GH_TOKEN"; else printf '%s\\n' "\${TC_GH_USER:-}"; fi
-  exit 0
-fi
-if [ -n "\${TC_GL_HOST:-}" ] && [ "$host" = "$TC_GL_HOST" ]; then
-  if [ "$want" = "token" ]; then [ -n "\${TC_GL_TOKEN:-}" ] || exit 1; printf '%s\\n' "$TC_GL_TOKEN"; else printf '%s\\n' "\${TC_GL_USER:-}"; fi
-  exit 0
-fi
-exit 1
-`;
-
-let gitAskpassPath = null;
-function ensureGitAskpassScript() {
-  if (gitAskpassPath !== null) return gitAskpassPath;
-  const file = path.join(os.tmpdir(), `terracode-git-askpass-${process.pid}-${crypto.randomBytes(4).toString('hex')}.sh`);
-  fs.writeFileSync(file, GIT_ASKPASS_SCRIPT, { mode: 0o700 });
-  gitAskpassPath = file;
-  return file;
+function normalizeGitHost(host) {
+  if (typeof host !== 'string' || host.trim() === '') return null;
+  const raw = host.trim();
+  if (/[\s/@?#\\]/.test(raw)) return null;
+  try {
+    const url = new URL(`https://${raw}`);
+    if (!url.hostname || url.username || url.password || url.pathname !== '/' || url.search || url.hash) return null;
+    return url.host.toLowerCase();
+  } catch {
+    return null;
+  }
 }
 
-// Environment for git network operations (push/pull/fetch): terminal prompts
-// always disabled; stored credentials exposed to the askpass helper only while
-// the credential store is unlocked and at least one git provider has a token.
-function gitNetworkEnv() {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+function gitCredentialForPrompt(prompt) {
+  if (typeof prompt !== 'string') return null;
+  const match = prompt.match(/^(Username|Password) for ['"]?(https:\/\/[^'"\s]+)['"]?:\s*$/i);
+  if (!match) return null;
+  let url;
+  try { url = new URL(match[2]); } catch { return null; }
+  if (url.protocol !== 'https:') return null;
   const payload = credUnlockEntry();
-  if (payload === null) return env;
-  let any = false;
+  if (payload === null) return null;
   for (const [provider, defaultHost] of Object.entries(GIT_CRED_PROVIDERS)) {
     const creds = payload[provider];
     if (!creds || typeof creds.token !== 'string' || creds.token === '') continue;
-    const host = typeof creds.host === 'string' && creds.host.trim() !== '' ? creds.host.trim().toLowerCase() : defaultHost;
-    const prefix = provider === 'github' ? 'TC_GH' : 'TC_GL';
-    env[`${prefix}_HOST`] = host;
-    env[`${prefix}_USER`] = typeof creds.username === 'string' ? creds.username : '';
-    env[`${prefix}_TOKEN`] = creds.token;
-    any = true;
+    const host = creds.host?.trim() ? normalizeGitHost(creds.host) : defaultHost;
+    if (host !== url.host.toLowerCase()) continue;
+    return match[1].toLowerCase() === 'password' ? creds.token : (creds.username || null);
   }
-  if (any) {
-    env.GIT_ASKPASS = ensureGitAskpassScript();
-    env.LC_ALL = 'C'; // keep the askpass prompts in English for host parsing
+  return null;
+}
+
+function shellQuote(value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'";
+}
+
+function writeGitAskpassScript(dir) {
+  const file = path.join(dir, 'askpass.sh');
+  const isSea = require('node:sea').isSea();
+  const helper = isSea ? '--terracode-git-askpass' : shellQuote(path.join(__dirname, 'scripts', 'git-askpass.cjs'));
+  fs.writeFileSync(file, `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${helper} "$@"\n`, { mode: 0o700 });
+  return file;
+}
+
+async function runGitNetwork(cwd, args, timeoutMs = GIT_NETWORK_TIMEOUT_MS) {
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  const payload = credUnlockEntry();
+  const available = payload && Object.keys(GIT_CRED_PROVIDERS).some(p => typeof payload[p]?.token === 'string' && payload[p].token !== '');
+  if (!available) return runGit(cwd, args, timeoutMs, env);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'terracode-git-'));
+  const key = crypto.randomBytes(32).toString('hex');
+  const clients = new Set();
+  const broker = net.createServer(client => {
+    clients.add(client);
+    client.on('close', () => clients.delete(client));
+    client.on('error', () => {});
+    client.setTimeout(5000, () => client.destroy());
+    let data = '';
+    client.on('data', chunk => {
+      data += chunk.toString();
+      if (data.length > 4096) return client.destroy();
+      if (!data.includes('\n')) return;
+      let value = null;
+      try {
+        const request = JSON.parse(data.split('\n')[0]);
+        if (typeof request.key === 'string' && request.key.length === key.length &&
+            crypto.timingSafeEqual(Buffer.from(request.key), Buffer.from(key))) value = gitCredentialForPrompt(request.prompt);
+      } catch { /* invalid request */ }
+      client.end(JSON.stringify({ value }));
+    });
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      broker.once('error', reject);
+      broker.listen(0, '127.0.0.1', () => { broker.removeListener('error', reject); resolve(); });
+    });
+    broker.on('error', () => {});
+    env.GIT_ASKPASS = writeGitAskpassScript(dir);
+    env.TERRACODE_GIT_PORT = String(broker.address().port);
+    env.TERRACODE_GIT_KEY = key;
+    env.LC_ALL = 'C';
+    return await runGit(cwd, args, timeoutMs, env);
+  } finally {
+    for (const client of clients) client.destroy();
+    if (broker.listening) await new Promise(resolve => broker.close(resolve));
+    fs.rmSync(dir, { recursive: true, force: true });
   }
-  return env;
 }
 
 function runGit(cwd, args, timeoutMs = GIT_TIMEOUT_MS, env) {
@@ -3476,14 +3615,17 @@ app.post('/api/git/rebase-step', async (req, res) => {
 // returns credential values; management reuses /api/cloud/credentials.
 app.get('/api/git/credentials', (req, res) => {
   const fileObj = readCredFile();
-  const all = fileObj !== null && Array.isArray(fileObj.meta?.providers) ? fileObj.meta.providers : [];
+  const payload = credUnlockEntry();
+  const all = payload !== null ? Object.keys(payload) : fileObj !== null && Array.isArray(fileObj.meta?.providers) ? fileObj.meta.providers : [];
   // Non-secret identifiers only (username/host/token presence) — safe to expose
   // while locked; lets the UI show what is stored across restarts.
-  const gitMeta = fileObj !== null && isPlainObject(fileObj.meta?.git) ? fileObj.meta.git : {};
+  const gitMeta = payload !== null ? gitCredentialMetadata(payload) : fileObj !== null && isPlainObject(fileObj.meta?.git) ? fileObj.meta.git : {};
+  const unlocked = payload !== null;
   res.json({
     exists: fileObj !== null,
     providers: all.filter(p => Object.hasOwn(GIT_CRED_PROVIDERS, p)),
-    unlocked: credUnlockEntry() !== null,
+    unlocked,
+    ...(unlocked ? { unlockedUntil: credUnlockExpiry } : {}),
     stored: gitMeta,
   });
 });
@@ -3500,7 +3642,9 @@ app.post('/api/git/credentials/test', async (req, res) => {
   }
 
   let token = typeof body.token === 'string' ? body.token.trim() : '';
-  let host = typeof body.host === 'string' ? body.host.trim().toLowerCase() : '';
+  const requestedHost = typeof body.host === 'string' ? body.host.trim() : '';
+  let host = requestedHost ? normalizeGitHost(requestedHost) : '';
+  if (requestedHost && host === null) return res.status(400).json({ error: 'Invalid instance host' });
 
   if (token === '') {
     const payload = credUnlockEntry();
@@ -3509,7 +3653,10 @@ app.post('/api/git/credentials/test', async (req, res) => {
       return res.status(401).json({ error: `No ${provider} credentials to test — fill in the form or unlock the store` });
     }
     token = stored.token;
-    if (host === '' && typeof stored.host === 'string') host = stored.host.trim().toLowerCase();
+    const storedHost = stored.host?.trim() ? normalizeGitHost(stored.host) : GIT_CRED_PROVIDERS[provider];
+    if (storedHost === null) return res.status(400).json({ error: 'Invalid stored instance host' });
+    if (host && host !== storedHost) return res.status(400).json({ error: 'Stored credentials can only be tested against their registered host' });
+    host = storedHost;
   }
 
   const baseHost = host !== '' ? host : GIT_CRED_PROVIDERS[provider];
@@ -3528,7 +3675,7 @@ app.post('/api/git/credentials/test', async (req, res) => {
 
   let upstream;
   try {
-    upstream = await fetch(url, { headers, signal: AbortSignal.timeout(GIT_CRED_TEST_TIMEOUT_MS) });
+    upstream = await fetch(url, { headers, redirect: 'error', signal: AbortSignal.timeout(GIT_CRED_TEST_TIMEOUT_MS) });
   } catch (err) {
     return res.status(502).json({ error: `Connection to ${baseHost} failed: ${err.message}` });
   }
@@ -3647,7 +3794,7 @@ app.post('/api/git/push', async (req, res) => {
     if (setUpstream) args.push('-u');
     args.push('origin');
     if (pushBranch) args.push(pushBranch);
-    const result = await runGit(dir, args, GIT_NETWORK_TIMEOUT_MS, gitNetworkEnv());
+    const result = await runGitNetwork(dir, args, GIT_NETWORK_TIMEOUT_MS);
     if (result.error === 'enoent') {
       return res.status(503).json({ error: 'git executable not found in PATH' });
     }
@@ -3681,7 +3828,7 @@ app.post('/api/git/pull', async (req, res) => {
   try {
     const args = ['pull'];
     if (branch) args.push('origin', branch);
-    const result = await runGit(dir, args, GIT_NETWORK_TIMEOUT_MS, gitNetworkEnv());
+    const result = await runGitNetwork(dir, args, GIT_NETWORK_TIMEOUT_MS);
     if (result.error === 'enoent') {
       return res.status(503).json({ error: 'git executable not found in PATH' });
     }
@@ -3710,7 +3857,7 @@ app.post('/api/git/fetch', async (req, res) => {
   }
   gitBusy.add(dir);
   try {
-    const result = await runGit(dir, ['fetch', '--all'], GIT_NETWORK_TIMEOUT_MS, gitNetworkEnv());
+    const result = await runGitNetwork(dir, ['fetch', '--all'], GIT_NETWORK_TIMEOUT_MS);
     if (result.error === 'enoent') {
       return res.status(503).json({ error: 'git executable not found in PATH' });
     }
@@ -3874,5 +4021,3 @@ if (require.main === module) {
 module.exports = app;
 module.exports.startFileWatcher = startFileWatcher;
 module.exports.stopFileWatcher = stopFileWatcher;
-module.exports.gitNetworkEnv = gitNetworkEnv;
-module.exports.ensureGitAskpassScript = ensureGitAskpassScript;

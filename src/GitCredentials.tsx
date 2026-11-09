@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactElement } from 'react'
 import {
   cloudCredentialAction,
+  CREDENTIALS_CHANGED_EVENT,
   getGitCredentialStatus,
   GIT_CRED_PROVIDER_LABELS,
   testGitCredentials,
@@ -30,13 +31,13 @@ const EMPTY_FIELDS: GitFields = {
   glHost: ''
 }
 
-function fieldsToPayload(f: GitFields): CloudCredentialsPayload {
+function fieldsToPayload(f: GitFields, removed: GitCredProvider[]): CloudCredentialsPayload {
   const payload: CloudCredentialsPayload = {}
-  if (f.ghUser !== '' || f.ghToken !== '' || f.ghHost !== '') {
-    payload.github = { username: f.ghUser, token: f.ghToken, host: f.ghHost }
+  if (!removed.includes('github') && (f.ghUser !== '' || f.ghToken !== '' || f.ghHost !== '')) {
+    payload.github = { ...(f.ghUser !== '' ? { username: f.ghUser } : {}), ...(f.ghToken !== '' ? { token: f.ghToken } : {}), ...(f.ghHost !== '' ? { host: f.ghHost } : {}) }
   }
-  if (f.glUser !== '' || f.glToken !== '' || f.glHost !== '') {
-    payload.gitlab = { username: f.glUser, token: f.glToken, host: f.glHost }
+  if (!removed.includes('gitlab') && (f.glUser !== '' || f.glToken !== '' || f.glHost !== '')) {
+    payload.gitlab = { ...(f.glUser !== '' ? { username: f.glUser } : {}), ...(f.glToken !== '' ? { token: f.glToken } : {}), ...(f.glHost !== '' ? { host: f.glHost } : {}) }
   }
   return payload
 }
@@ -64,7 +65,19 @@ const GitCredentials = (): ReactElement => {
 
   useEffect(() => {
     refresh()
+    window.addEventListener(CREDENTIALS_CHANGED_EVENT, refresh)
+    window.addEventListener('focus', refresh)
+    return () => {
+      window.removeEventListener(CREDENTIALS_CHANGED_EVENT, refresh)
+      window.removeEventListener('focus', refresh)
+    }
   }, [refresh])
+
+  useEffect(() => {
+    if (!status?.unlockedUntil) return
+    const timer = window.setTimeout(refresh, Math.max(1, status.unlockedUntil - Date.now() + 50))
+    return () => window.clearTimeout(timer)
+  }, [refresh, status?.unlockedUntil])
 
   // Leaving any form discards typed secrets from state.
   const exitForm = (next: FormMode, noticeText = '') => {
@@ -75,6 +88,17 @@ const GitCredentials = (): ReactElement => {
     setError('')
     setNotice(noticeText)
     setMode(next)
+  }
+
+  const beginEdit = () => {
+    exitForm('edit')
+    setFields({
+      ...EMPTY_FIELDS,
+      ghUser: status?.stored?.github?.username ?? '',
+      ghHost: status?.stored?.github?.host ?? '',
+      glUser: status?.stored?.gitlab?.username ?? '',
+      glHost: status?.stored?.gitlab?.host ?? ''
+    })
   }
 
   const act = async (
@@ -105,8 +129,8 @@ const GitCredentials = (): ReactElement => {
   }
 
   const providerValid = (provider: GitCredProvider): boolean => {
-    if (provider === 'github') return fields.ghUser.trim() !== '' && fields.ghToken.trim() !== ''
-    return fields.glUser.trim() !== '' && fields.glToken.trim() !== ''
+    if (provider === 'github') return fields.ghUser.trim() !== '' && (fields.ghToken.trim() !== '' || status?.stored?.github?.hasToken === true)
+    return fields.glUser.trim() !== '' && (fields.glToken.trim() !== '' || status?.stored?.gitlab?.hasToken === true)
   }
 
   const handleSave = async () => {
@@ -120,19 +144,7 @@ const GitCredentials = (): ReactElement => {
       setError('Passphrases do not match.')
       return
     }
-    const payload = fieldsToPayload(fields)
-
-    // Removing every configured provider empties the shared store — that is a
-    // full delete (cloud credentials included), so confirm it explicitly.
-    if (isEdit && removeProviders.length > 0 && removeProviders.join(',') === (status?.providers ?? []).join(',')) {
-      const ok = window.confirm(
-        'Removing these deletes the entire credential store, including any cloud credentials. Continue?',
-      )
-      if (!ok) return
-      const done = await act('delete', { passphrase: pass1 })
-      if (done) exitForm('status', 'Git credentials removed.')
-      return
-    }
+    const payload = fieldsToPayload(fields, removeProviders)
 
     for (const provider of Object.keys(payload) as GitCredProvider[]) {
       if (!providerValid(provider)) {
@@ -150,7 +162,7 @@ const GitCredentials = (): ReactElement => {
       credentials: payload,
       ...(isEdit && removeProviders.length > 0 ? { removeProviders } : {})
     })
-    if (ok) exitForm('status', isRegister ? 'Git credentials saved — unlock the store so git can use them.' : 'Git credentials updated.')
+    if (ok) exitForm('status', isRegister ? 'Git credentials saved and the store is unlocked.' : 'Git credentials updated.')
   }
 
   const handleUnlock = async () => {
@@ -177,10 +189,14 @@ const GitCredentials = (): ReactElement => {
           ? { username: fields.ghUser, token: fields.ghToken, host: fields.ghHost }
           : { username: fields.glUser, token: fields.glToken, host: fields.glHost }
       const inline = inForm && fieldsForProvider.token !== ''
+      if (inForm && !inline && fieldsForProvider.host.trim() !== '' && fieldsForProvider.host.trim().toLowerCase() !== status?.stored?.[provider]?.host) {
+        throw new Error('Enter the token to test a different host before saving.')
+      }
       const res = await testGitCredentials(provider, inline ? fieldsForProvider : undefined)
       setNotice(`${GIT_CRED_PROVIDER_LABELS[provider]} OK — authenticated as ${res.identity} on ${res.host}.`)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Test failed')
+      refresh()
     } finally {
       setTesting(null)
     }
@@ -280,7 +296,7 @@ const GitCredentials = (): ReactElement => {
                 {testing === (p as GitCredProvider) ? 'Testing…' : `Test ${GIT_CRED_PROVIDER_LABELS[p as GitCredProvider]}`}
               </button>
             ))}
-            <button onClick={() => exitForm('edit')} disabled={busy} title="Edit stored credentials (asks for the current passphrase)">
+            <button onClick={beginEdit} disabled={busy || !status.unlocked} title="Unlock the store to edit saved identifiers">
               Edit
             </button>
           </div>
@@ -386,7 +402,7 @@ const GitCredentials = (): ReactElement => {
       )}
 
       {error !== '' && <p className="tf-status error">{error}</p>}
-      {notice !== '' && !showForm && <p className="tf-status ok">{notice}</p>}
+      {notice !== '' && <p className="tf-status ok">{notice}</p>}
     </div>
   )
 }

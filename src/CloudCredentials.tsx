@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useState, type ReactElement } from 'react'
 import {
   CLOUD_PROVIDER_LABELS,
+  CREDENTIALS_CHANGED_EVENT,
   cloudCredentialAction,
   getCloudStatus,
-  type CloudCredActionResult,
   type CloudCredentialsPayload,
   type CloudProvider,
   type CloudStatus
 } from './api'
 
-type FormMode = 'status' | 'register' | 'edit' | 'change-passphrase'
+type FormMode = 'status' | 'register' | 'edit' | 'change-passphrase' | 'delete'
 
 // All credential fields in one flat state so switching between provider
 // sections never loses typed values.
@@ -39,26 +39,29 @@ const EMPTY_FIELDS: CredFields = {
   gcpProjectId: ''
 }
 
-function fieldsToPayload(f: CredFields): CloudCredentialsPayload {
+function fieldsToPayload(f: CredFields, removed: CloudProvider[], clearSession: boolean): CloudCredentialsPayload {
   const payload: CloudCredentialsPayload = {}
-  if (f.awsAccessKeyId !== '' || f.awsSecretAccessKey !== '' || f.awsSessionToken !== '' || f.awsRegion !== '') {
+  if (!removed.includes('aws') && (f.awsAccessKeyId !== '' || f.awsSecretAccessKey !== '' || f.awsSessionToken !== '' || f.awsRegion !== '' || clearSession)) {
     payload.aws = {
-      accessKeyId: f.awsAccessKeyId,
-      secretAccessKey: f.awsSecretAccessKey,
-      sessionToken: f.awsSessionToken,
-      region: f.awsRegion
+      ...(f.awsAccessKeyId !== '' ? { accessKeyId: f.awsAccessKeyId } : {}),
+      ...(f.awsSecretAccessKey !== '' ? { secretAccessKey: f.awsSecretAccessKey } : {}),
+      ...(clearSession ? { sessionToken: '' } : f.awsSessionToken !== '' ? { sessionToken: f.awsSessionToken } : {}),
+      ...(f.awsRegion !== '' ? { region: f.awsRegion } : {})
     }
   }
-  if (f.azureClientId !== '' || f.azureClientSecret !== '' || f.azureTenantId !== '' || f.azureSubscriptionId !== '') {
+  if (!removed.includes('azure') && (f.azureClientId !== '' || f.azureClientSecret !== '' || f.azureTenantId !== '' || f.azureSubscriptionId !== '')) {
     payload.azure = {
-      clientId: f.azureClientId,
-      clientSecret: f.azureClientSecret,
-      tenantId: f.azureTenantId,
-      subscriptionId: f.azureSubscriptionId
+      ...(f.azureClientId !== '' ? { clientId: f.azureClientId } : {}),
+      ...(f.azureClientSecret !== '' ? { clientSecret: f.azureClientSecret } : {}),
+      ...(f.azureTenantId !== '' ? { tenantId: f.azureTenantId } : {}),
+      ...(f.azureSubscriptionId !== '' ? { subscriptionId: f.azureSubscriptionId } : {})
     }
   }
-  if (f.gcpServiceAccountJson.trim() !== '' || f.gcpProjectId !== '') {
-    payload.gcp = { serviceAccountJson: f.gcpServiceAccountJson, projectId: f.gcpProjectId }
+  if (!removed.includes('gcp') && (f.gcpServiceAccountJson.trim() !== '' || f.gcpProjectId !== '')) {
+    payload.gcp = {
+      ...(f.gcpServiceAccountJson.trim() !== '' ? { serviceAccountJson: f.gcpServiceAccountJson } : {}),
+      ...(f.gcpProjectId !== '' ? { projectId: f.gcpProjectId } : {})
+    }
   }
   return payload
 }
@@ -72,6 +75,7 @@ const CloudCredentials = (): ReactElement => {
   const [fields, setFields] = useState<CredFields>(EMPTY_FIELDS)
   // Providers to drop on save (edit mode only; the server keeps the rest).
   const [removeProviders, setRemoveProviders] = useState<CloudProvider[]>([])
+  const [clearSession, setClearSession] = useState(false)
 
   const [pass1, setPass1] = useState('')
   const [pass2, setPass2] = useState('')
@@ -85,17 +89,44 @@ const CloudCredentials = (): ReactElement => {
 
   useEffect(() => {
     refresh()
+    window.addEventListener(CREDENTIALS_CHANGED_EVENT, refresh)
+    window.addEventListener('focus', refresh)
+    return () => {
+      window.removeEventListener(CREDENTIALS_CHANGED_EVENT, refresh)
+      window.removeEventListener('focus', refresh)
+    }
   }, [refresh])
+
+  useEffect(() => {
+    if (!status?.unlockedUntil) return
+    const timer = window.setTimeout(refresh, Math.max(1, status.unlockedUntil - Date.now() + 50))
+    return () => window.clearTimeout(timer)
+  }, [refresh, status?.unlockedUntil])
 
   // Leaving any form discards typed secrets from state.
   const exitForm = (next: FormMode, noticeText = '') => {
     setFields(EMPTY_FIELDS)
     setRemoveProviders([])
+    setClearSession(false)
     setPass1('')
     setPass2('')
     setError('')
     setNotice(noticeText)
     setMode(next)
+  }
+
+  const beginEdit = () => {
+    exitForm('edit')
+    const details = status?.details
+    setFields({
+      ...EMPTY_FIELDS,
+      awsAccessKeyId: details?.aws?.accessKeyId ?? '',
+      awsRegion: details?.aws?.region ?? '',
+      azureClientId: details?.azure?.clientId ?? '',
+      azureTenantId: details?.azure?.tenantId ?? '',
+      azureSubscriptionId: details?.azure?.subscriptionId ?? '',
+      gcpProjectId: details?.gcp?.projectId ?? ''
+    })
   }
 
   const act = async (
@@ -111,8 +142,8 @@ const CloudCredentials = (): ReactElement => {
     setBusy(true)
     setError('')
     try {
-      const res: CloudCredActionResult = await cloudCredentialAction(action, payload)
-      setStatus(res)
+      await cloudCredentialAction(action, payload)
+      refresh()
       return true
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Operation failed')
@@ -128,12 +159,12 @@ const CloudCredentials = (): ReactElement => {
       setError('Passphrase must be at least 8 characters.')
       return
     }
-    if (pass1 !== pass2) {
+    const isRegister = mode === 'register' || status?.exists !== true
+    if (isRegister && pass1 !== pass2) {
       setError('Passphrases do not match.')
       return
     }
-    const payload = fieldsToPayload(fields)
-    const isRegister = mode === 'register' || status?.exists !== true
+    const payload = fieldsToPayload(fields, removeProviders, clearSession)
     if (isRegister && Object.keys(payload).length === 0) {
       setError('Fill in at least one credential field.')
       return
@@ -171,7 +202,7 @@ const CloudCredentials = (): ReactElement => {
   const handleDelete = async () => {
     if (busy || pass1 === '') return
     const ok = window.confirm(
-      'Delete the entire credential store, including any Git (GitHub/GitLab) credentials? All active cloud logins end and terraform runs stop receiving them.',
+      'Delete the local credential store, including Git credentials? No cloud resources or remote accounts will be deleted.',
     )
     if (!ok) return
     const done = await act('delete', { passphrase: pass1 })
@@ -230,7 +261,7 @@ const CloudCredentials = (): ReactElement => {
           {status.unlocked && status.details && configured.map(p => {
             const d = status.details?.[p]
             if (!d) return null
-            const parts = Object.values(d).filter(v => v !== '')
+            const parts = Object.values(d).filter((v): v is string => typeof v === 'string' && v !== '')
             if (parts.length === 0) return null
             return (
               <p key={`detail-${p}`} className="tf-status">
@@ -238,6 +269,12 @@ const CloudCredentials = (): ReactElement => {
               </p>
             )
           })}
+          {configured.some(p => !status.sessions[p]) && status.unlocked && (
+            <p className="tf-status">Unlocked only opens the local store. Use Login in the Terraform panel to authenticate before running cloud commands.</p>
+          )}
+          {status.unlocked && status.details?.aws && !status.details.aws.hasSecretAccessKey && (
+            <p className="tf-status error">The AWS secret access key is missing. Edit the AWS credentials and save a valid key before logging in.</p>
+          )}
           {!status.unlocked && (
             <div className="tf-creds-row">
               <input
@@ -262,13 +299,13 @@ const CloudCredentials = (): ReactElement => {
                 Lock
               </button>
             )}
-            <button onClick={() => exitForm('edit')} disabled={busy} title="Edit stored credentials (asks for the current passphrase)">
+            <button onClick={beginEdit} disabled={busy || !status.unlocked} title="Unlock the store to edit saved identifiers">
               Edit
             </button>
             <button onClick={() => exitForm('change-passphrase')} disabled={busy}>
               Change passphrase
             </button>
-            <button className="danger" onClick={() => void handleDelete()} disabled={busy} title="Delete the encrypted store">
+            <button className="danger" onClick={() => exitForm('delete')} disabled={busy} title="Delete the local encrypted store">
               Delete…
             </button>
           </div>
@@ -293,11 +330,16 @@ const CloudCredentials = (): ReactElement => {
                 {provider === 'aws' && !removed && (
                   <>
                     <input value={fields.awsAccessKeyId} onChange={e => setField('awsAccessKeyId', e.target.value)} placeholder="Access key ID" aria-label="AWS access key ID" />
-                    <input type="password" value={fields.awsSecretAccessKey} onChange={e => setField('awsSecretAccessKey', e.target.value)} placeholder="Secret access key" aria-label="AWS secret access key" autoComplete="off" />
+                    <input type="password" value={fields.awsSecretAccessKey} onChange={e => setField('awsSecretAccessKey', e.target.value)} placeholder={isEdit && status?.details?.aws?.hasSecretAccessKey ? 'Stored — leave blank to keep current secret' : 'Secret access key'} aria-label="AWS secret access key" autoComplete="off" />
                     <div className="tf-creds-row">
                       <input type="password" value={fields.awsSessionToken} onChange={e => setField('awsSessionToken', e.target.value)} placeholder="Session token (STS only)" aria-label="AWS session token" autoComplete="off" />
                       <input value={fields.awsRegion} onChange={e => setField('awsRegion', e.target.value)} placeholder="Region, e.g. us-east-2" aria-label="AWS region" />
                     </div>
+                    {isEdit && status?.details?.aws?.hasSessionToken && (
+                      <label className="tf-cred-remove">
+                        <input type="checkbox" checked={clearSession} onChange={e => setClearSession(e.target.checked)} /> Clear saved session token
+                      </label>
+                    )}
                   </>
                 )}
                 {provider === 'azure' && !removed && (
@@ -328,8 +370,7 @@ const CloudCredentials = (): ReactElement => {
 
           {isEdit && (
             <p className="tf-status">
-              Leave a provider's fields empty to keep its stored values, or tick “remove” to drop it. Saving replaces the
-              filled-in providers.
+              Identifiers are filled in for editing. Leave secret fields empty to keep their stored values; tick “remove” to remove a provider locally.
             </p>
           )}
 
@@ -381,8 +422,19 @@ const CloudCredentials = (): ReactElement => {
         </div>
       )}
 
+      {mode === 'delete' && (
+        <div className="tf-creds-form">
+          <p className="tf-status">Only the local credential store is removed; remote resources and accounts are not changed.</p>
+          <input type="password" value={pass1} onChange={e => setPass1(e.target.value)} placeholder="Current passphrase" aria-label="Passphrase to delete local credentials" disabled={busy} />
+          <div className="tf-creds-row">
+            <button className="danger" onClick={() => void handleDelete()} disabled={busy || pass1 === ''}>Delete local store</button>
+            <button onClick={() => exitForm('status')} disabled={busy}>Cancel</button>
+          </div>
+        </div>
+      )}
+
       {error !== '' && <p className="tf-status error">{error}</p>}
-      {notice !== '' && !showForm && mode !== 'change-passphrase' && <p className="tf-status ok">{notice}</p>}
+      {notice !== '' && !showForm && mode === 'status' && <p className="tf-status ok">{notice}</p>}
     </div>
   )
 }

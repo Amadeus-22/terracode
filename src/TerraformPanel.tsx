@@ -7,6 +7,7 @@ import { costFailureDetail, costNeedsApiKey, driftOutcome } from './tfStatus'
 import {
   getTfCost,
   getTfCostAvailability,
+  getTerraformPlanJson,
   getTfStateInfo,
   getTfVersions,
   installTfVersion,
@@ -223,6 +224,10 @@ const TerraformPanel = ({ dirPath, projectDir = null, onLoadProject, onFmtApplie
   const [running, setRunning] = useState<TfCommand | null>(null)
   const [result, setResult] = useState<TfRunResult | null>(null)
   const [error, setError] = useState('')
+  const [planJson, setPlanJson] = useState<string | null>(null)
+  const [planJsonBusy, setPlanJsonBusy] = useState(false)
+  const [planJsonError, setPlanJsonError] = useState('')
+  const planJsonGeneration = useRef(0)
 
   // The Version result is informational — it auto-hides after a short while.
   const [versionDismissed, setVersionDismissed] = useState(false)
@@ -621,6 +626,9 @@ const TerraformPanel = ({ dirPath, projectDir = null, onLoadProject, onFmtApplie
     setRunning(command)
     setError('')
     setResult(null)
+    planJsonGeneration.current += 1
+    setPlanJson(null)
+    setPlanJsonError('')
     setApplyReady(false)
     setDestroyReady(false)
     // A new command supersedes a stale install error.
@@ -682,6 +690,27 @@ const TerraformPanel = ({ dirPath, projectDir = null, onLoadProject, onFmtApplie
       setError(err instanceof Error ? err.message : 'Terraform command failed')
     } finally {
       setRunning(null)
+    }
+  }
+
+  const showPlanJson = async () => {
+    if (!dirPath || result?.command !== 'plan' || !result.previewId || planJsonBusy) return
+    if (planJson !== null) {
+      setPlanJson(null)
+      return
+    }
+    const confirmed = window.confirm('Raw Terraform plan JSON can contain sensitive values in plain text. Show it on this device?')
+    if (!confirmed) return
+    setPlanJsonBusy(true)
+    setPlanJsonError('')
+    const generation = planJsonGeneration.current
+    try {
+      const preview = await getTerraformPlanJson(dirPath, result.previewId)
+      if (generation === planJsonGeneration.current) setPlanJson(preview.rawJson)
+    } catch (err) {
+      if (generation === planJsonGeneration.current) setPlanJsonError(err instanceof Error ? err.message : 'Could not load plan JSON')
+    } finally {
+      setPlanJsonBusy(false)
     }
   }
 
@@ -1268,6 +1297,9 @@ const TerraformPanel = ({ dirPath, projectDir = null, onLoadProject, onFmtApplie
           {logStatus !== null && (
             <p className={`tf-status ${logStatus.ok ? 'ok' : 'error'}`}>{logStatus.text}</p>
           )}
+          {result !== null && 'output' in result && /No valid credential sources found|failed to refresh cached credentials/i.test(result.output) && (
+            <p className="tf-status error">AWS credentials are unavailable. Check your local credential chain or open Login and authenticate AWS; unlocking the store alone does not start a cloud session.</p>
+          )}
           <pre
             ref={el => {
               logRef.current = el
@@ -1294,6 +1326,11 @@ const TerraformPanel = ({ dirPath, projectDir = null, onLoadProject, onFmtApplie
                   Estimate costs
                 </button>
               )}
+              {result.command === 'plan' && result.exitCode === 0 && result.previewId && (
+                <button onClick={() => void showPlanJson()} disabled={planJsonBusy} title="Raw JSON may include sensitive values">
+                  {planJsonBusy ? 'Loading JSON…' : planJson !== null ? 'Hide raw JSON' : 'View raw JSON…'}
+                </button>
+              )}
               {result.command === 'plan-file' && applyReady && (
                 <>
                   <button onClick={() => void run('show-plan')}>Review saved plan</button>{' '}
@@ -1317,6 +1354,16 @@ const TerraformPanel = ({ dirPath, projectDir = null, onLoadProject, onFmtApplie
                 <button onClick={() => void run('state-list')}>Refresh state list</button>
               )}
             </div>
+          )}
+          {planJsonError !== '' && <p className="tf-status error">{planJsonError}</p>}
+          {result?.command === 'plan' && result.exitCode === 0 && !result.previewId && (
+            <p className="tf-status">Raw plan JSON is unavailable for this run.</p>
+          )}
+          {planJson !== null && (
+            <>
+              <p className="tf-status">Raw plan JSON can include sensitive values. Avoid sharing this output.</p>
+              <pre className="tf-output">{planJson}</pre>
+            </>
           )}
 
           {/* State surgery controls — reachable from the Log view only */}
