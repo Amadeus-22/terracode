@@ -63,7 +63,7 @@ let failures;
 try {
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('Startup timeout: ' + logs)), 15000);
-    const ready = data => {
+    const ready = () => {
       if (!logs.includes('TerraCode pilot:')) return;
       clearTimeout(timeout);
       child.stdout.off('data', ready);
