@@ -1735,6 +1735,30 @@ describe('POST /api/tf/run (lifecycle)', () => {
     expect(fs.existsSync(path.join(dir, '.apply-log'))).toBe(false)
   })
 
+  it('rejects a saved plan replaced before its public path is fingerprinted', async () => {
+    const dir = await plannedProject('replacement-before-hash')
+    const file = path.join(dir, 'tf.plan')
+    const originalOpen = fs.openSync
+    let replaced = false
+    const spy = vi.spyOn(fs, 'openSync').mockImplementation((target, flags, ...args) => {
+      if (target === file && flags === 'r' && !replaced) {
+        replaced = true
+        fs.writeFileSync(file + '.replacement', 'different simulated plan')
+        fs.renameSync(file + '.replacement', file)
+      }
+      return originalOpen(target, flags, ...args)
+    })
+    try {
+      await request(app).post('/api/tf/run').send({ command: 'plan-file', path: dir })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(replaced).toBe(true)
+    expect((await apply(dir)).status).toBe(409)
+    expect(fs.existsSync(path.join(dir, '.apply-log'))).toBe(false)
+    expect(fs.readdirSync(dir).some(name => name.startsWith('.terracode-plan-'))).toBe(false)
+  })
+
   it('fails closed when tf.plan was not created through plan-file', async () => {
     const dir = await plannedProject('stale-foreign')
     fs.writeFileSync(path.join(dir, 'tf.plan'), 'plan made elsewhere')
@@ -1842,8 +1866,8 @@ describe('POST /api/tf/run (new commands)', () => {
     expect(res.status).toBe(200)
     expect(res.body.exitCode).toBe(0)
     expect(fs.existsSync(path.join(dir, 'tf.plan'))).toBe(true)
-    expect(fs.readFileSync(path.join(dir, '.plan-args'), 'utf-8').trim()).toBe(
-      'plan -input=false -no-color -destroy -out=tf.plan'
+    expect(fs.readFileSync(path.join(dir, '.plan-args'), 'utf-8').trim()).toMatch(
+      /^plan -input=false -no-color -destroy -out=.*[\\/]\.terracode-plan-[^\\/]+[\\/]tf\.plan$/
     )
     expect(res.body.output).toContain('1 to destroy')
   })

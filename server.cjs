@@ -750,7 +750,7 @@ const TF_COMMANDS = {
   output: ['output', '-no-color'],
   'state-list': ['state', 'list', '-no-color'],
   // Guarded apply flow, see TF_PLAN_FILE above.
-  'plan-file': ['plan', '-input=false', '-no-color', `-out=${TF_PLAN_FILE}`],
+  'plan-file': ['plan', '-input=false', '-no-color'],
   apply: ['apply', '-input=false', '-no-color', TF_PLAN_FILE],
   version: ['version', '-no-color'],
   'init-upgrade': ['init', '-input=false', '-no-color', '-upgrade'],
@@ -758,7 +758,7 @@ const TF_COMMANDS = {
   // Inspect the saved execution plan (terraform show tfplan).
   'show-plan': ['show', '-no-color', TF_PLAN_FILE],
   // Guarded destroy flow: save a destroy plan, then `apply` applies that file.
-  'plan-file-destroy': ['plan', '-input=false', '-no-color', '-destroy', `-out=${TF_PLAN_FILE}`],
+  'plan-file-destroy': ['plan', '-input=false', '-no-color', '-destroy'],
 };
 
 // Commands with client-supplied arguments (each argument validated separately).
@@ -1225,9 +1225,9 @@ function hashTfFile(file) {
 
 // Map(relative name -> fingerprint). Metadata is used only while a plan runs,
 // so a later timestamp-only change does not block an otherwise valid plan.
-function tfPlanFingerprint(dir, { includePlan = true, metadata = false } = {}) {
+function tfPlanFingerprint(dir, { includePlan = true, metadata = false, planFile = path.join(dir, TF_PLAN_FILE) } = {}) {
   const { files } = tfConfigFiles(dir);
-  if (includePlan) files.push(path.join(dir, TF_PLAN_FILE));
+  if (includePlan) files.push(planFile);
   if (files.length > TF_PLAN_MAX_FILES) throw new Error('too many configuration files');
   const out = new Map();
   for (const file of files) {
@@ -1237,7 +1237,7 @@ function tfPlanFingerprint(dir, { includePlan = true, metadata = false } = {}) {
       const target = fs.statSync(file, { bigint: true });
       fingerprint += `:${link.dev}:${link.ino}:${link.ctimeNs}:${target.dev}:${target.ino}:${target.ctimeNs}`;
     }
-    out.set(path.relative(dir, file), fingerprint);
+    out.set(includePlan && file === planFile ? TF_PLAN_FILE : path.relative(dir, file), fingerprint);
   }
   return out;
 }
@@ -1312,6 +1312,7 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
   const savesPlan = command === 'plan-file' || command === 'plan-file-destroy';
   let planBefore;
   let planWatch;
+  let savedPlanDir;
   if (savesPlan) tfPlanFingerprints.delete(dir);
 
   // fmt needs the pre-format content to build diffs; capture it first.
@@ -1347,6 +1348,8 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
         planWatch = watchTfPlanConfig(dir);
         const watched = tfPlanFingerprint(dir, { includePlan: false, metadata: true });
         if (!sameTfFingerprint(planBefore, watched)) throw new Error('Configuration changed before planning');
+        savedPlanDir = fs.mkdtempSync(path.join(dir, '.terracode-plan-'));
+        args.push(`-out=${path.join(savedPlanDir, TF_PLAN_FILE)}`);
       } catch {
         return { statusCode: 409, body: { error: 'The configuration cannot be checked safely. Check its files and modules before planning.' } };
       }
@@ -1360,11 +1363,17 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
         // Let queued filesystem events run before checking the final snapshot.
         await new Promise(resolve => setImmediate(resolve));
         const afterPlan = tfPlanFingerprint(dir, { includePlan: false, metadata: true });
-        const recorded = tfPlanFingerprint(dir);
+        const planFile = path.join(savedPlanDir, TF_PLAN_FILE);
+        const recorded = tfPlanFingerprint(dir, { planFile });
         const verified = tfPlanFingerprint(dir, { includePlan: false, metadata: true });
         await new Promise(resolve => setImmediate(resolve));
         if (planWatch.hasChanged() || !sameTfFingerprint(planBefore, afterPlan) || !sameTfFingerprint(afterPlan, verified)) {
           return { statusCode: 409, body: { error: 'The configuration changed while Terraform was planning. Run the plan again before applying.' } };
+        }
+        const publishedPlan = path.join(dir, TF_PLAN_FILE);
+        fs.renameSync(planFile, publishedPlan);
+        if (hashTfFile(publishedPlan) !== recorded.get(TF_PLAN_FILE)) {
+          return { statusCode: 409, body: { error: 'The saved plan changed during publication. Run the plan again before applying.' } };
         }
         tfPlanFingerprints.set(dir, recorded);
       } catch {
@@ -1373,6 +1382,7 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
     }
   } finally {
     planWatch?.close();
+    if (savedPlanDir) fs.rmSync(savedPlanDir, { recursive: true, force: true });
     if (previewDir) fs.rmSync(previewDir, { recursive: true, force: true });
   }
   if (result.error === 'enoent') {
