@@ -60,6 +60,8 @@ child.stdout.on('data', data => { logs += data; });
 child.stderr.on('data', data => { logs += data; });
 const exited = once(child, 'exit');
 let failures;
+let exitCode;
+const cleanupErrors = [];
 try {
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('Startup timeout: ' + logs)), 15000);
@@ -119,12 +121,25 @@ try {
   const [code] = await once(contender, 'exit');
   assert.equal(code, 1);
   assert.match(contenderLogs, /already in use/);
-  console.log('PASS: isolated executable, frontend assets, no source/maps, file read/write, path denial, Git commit, real Terraform init/validate/plan/apply/outputs/state/destroy, port conflict.');
 } catch (error) { failures = error; }
 finally {
-  child.kill('SIGTERM');
-  const [code] = await exited;
-  await fs.rm(sandbox, { recursive: true, force: true });
-  if (failures) throw new Error(failures.message + '\nExecutable output:\n' + logs, { cause: failures });
-  assert.equal(code, 0, 'Executable should stop cleanly');
+  try {
+    child.kill('SIGTERM');
+    [exitCode] = await exited;
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    await fs.rm(sandbox, { recursive: true, force: true });
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
 }
+if (failures) {
+  const failure = new Error(failures.message + '\nExecutable output:\n' + logs, { cause: failures });
+  if (cleanupErrors.length) throw new AggregateError([failure, ...cleanupErrors], 'Smoke test and cleanup failed');
+  throw failure;
+}
+if (cleanupErrors.length) throw new AggregateError(cleanupErrors, 'Smoke test cleanup failed');
+assert.equal(exitCode, 0, 'Executable should stop cleanly');
+console.log('PASS: isolated executable, frontend assets, no source/maps, file read/write, path denial, Git commit, real Terraform init/validate/plan/apply/outputs/state/destroy, port conflict.');
