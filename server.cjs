@@ -12,6 +12,7 @@ const chokidar = require('chokidar');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
+const net = require('net');
 const os = require('os');
 const path = require('path');
 
@@ -734,23 +735,24 @@ app.delete('/api/roots', (req, res) => {
 // apply only ever applies that saved file (never -auto-approve).
 const TF_PLAN_FILE = 'tf.plan';
 
+// All commands run in text mode (the same output a Linux shell would show);
+// the UI streams it verbatim and parses only what it needs from that text.
 const TF_COMMANDS = {
   fmt: ['fmt', '-recursive'],
-  validate: ['validate', '-json'],
-  plan: ['plan', '-no-color'],
-  'plan-json': ['plan', '-input=false', '-json'],
-  // Drift check: plan with -detailed-exitcode (0 = in sync, 2 = changes found)
-  // plus the JSON stream so the UI can show WHAT drifted. Read-only.
-  drift: ['plan', '-input=false', '-no-color', '-detailed-exitcode', '-json'],
+  validate: ['validate', '-no-color'],
+  plan: ['plan', '-input=false', '-no-color'],
+  // Drift check: plan with -detailed-exitcode (0 = in sync, 2 = changes found).
+  // Read-only.
+  drift: ['plan', '-input=false', '-no-color', '-detailed-exitcode'],
   // Dependency graph of the configuration (DOT on stdout). Read-only.
   graph: ['graph', '-no-color'],
   init: ['init', '-input=false', '-no-color'],
-  output: ['output', '-json'],
+  output: ['output', '-no-color'],
   'state-list': ['state', 'list', '-no-color'],
   // Guarded apply flow, see TF_PLAN_FILE above.
   'plan-file': ['plan', '-input=false', '-no-color', `-out=${TF_PLAN_FILE}`],
   apply: ['apply', '-input=false', '-no-color', TF_PLAN_FILE],
-  version: ['version', '-json'],
+  version: ['version', '-no-color'],
   'init-upgrade': ['init', '-input=false', '-no-color', '-upgrade'],
   'workspace-list': ['workspace', 'list', '-no-color'],
   // Inspect the saved execution plan (terraform show tfplan).
@@ -771,7 +773,7 @@ const TF_ARG_COMMANDS = new Set([
 ]);
 
 // Commands that accept -var-file=<name> pointing at a top-level .tfvars file.
-const TF_VARFILE_COMMANDS = new Set(['init', 'init-upgrade', 'plan', 'plan-json', 'drift', 'plan-file', 'plan-file-destroy']);
+const TF_VARFILE_COMMANDS = new Set(['init', 'init-upgrade', 'plan', 'drift', 'plan-file', 'plan-file-destroy']);
 
 // Terraform workspace name: letters, digits, '_' and '-' (terraform's own rule).
 function isValidWorkspaceName(name) {
@@ -847,7 +849,31 @@ function isValidConsoleExpression(expr) {
 const TF_TIMEOUT_MS = Number(process.env.TF_TIMEOUT_MS) || 120_000;
 const TF_MAX_FILES = 100; // cap on .tf files scanned for fmt before/after capture
 const tfRunning = new Set(); // real dir paths with an in-flight command
-const TF_MAX_PLAN_RESOURCES = 500; // cap on parsed resource_change entries
+const TF_PREVIEW_TTL_MS = 5 * 60_000;
+const TF_PREVIEW_MAX_BYTES = 16 * 1024 * 1024;
+const TF_PREVIEW_MAX_COUNT = 4;
+const tfPreviews = new Map();
+
+// Keep a short-lived plan in server memory so JSON represents the same plan as
+// the text. The temporary file is private and is removed immediately after use.
+function rememberTfPreview(dir, file) {
+  try {
+    if (fs.statSync(file).size > TF_PREVIEW_MAX_BYTES) return null;
+    const bytes = fs.readFileSync(file);
+    while (tfPreviews.size >= TF_PREVIEW_MAX_COUNT) {
+      const first = tfPreviews.keys().next().value;
+      clearTimeout(tfPreviews.get(first).timer);
+      tfPreviews.delete(first);
+    }
+    const id = crypto.randomBytes(16).toString('hex');
+    const timer = setTimeout(() => tfPreviews.delete(id), TF_PREVIEW_TTL_MS);
+    timer.unref();
+    tfPreviews.set(id, { dir, bytes, expiresAt: Date.now() + TF_PREVIEW_TTL_MS, timer });
+    return id;
+  } catch {
+    return null;
+  }
+}
 const TF_MAX_STATE_ADDRESSES = 1000;
 
 // Terraform resource address, e.g. aws_instance.web or module.vpc.aws_subnet.private[0].
@@ -857,147 +883,39 @@ function isValidTfAddress(addr) {
   return /^[A-Za-z0-9_-]+(\[[0-9]+\])?(\.[A-Za-z0-9_-]+(\[[0-9]+\])?)*$/.test(addr);
 }
 
-// --- Per-resource attribute diffs (plan deep-dive) -------------------------
-
-const TF_MAX_ATTR_CHANGES = 200; // cap on attribute changes per resource
-const TF_MAX_ATTR_VALUE_CHARS = 400; // truncate long stringified values
-
 function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 
-// Canonical JSON (sorted object keys) so value comparison and size checks do not
-// depend on key order.
-function canonValue(v) {
-  if (v === null || typeof v !== 'object') return JSON.stringify(v ?? null);
-  if (Array.isArray(v)) return `[${v.map(canonValue).join(',')}]`;
-  const keys = Object.keys(v).sort();
-  return `{${keys.map(k => `${JSON.stringify(k)}:${canonValue(v[k])}`).join(',')}}`;
-}
+// --- Plan summary from text-mode output --------------------------------------
 
-function tfValueEqual(a, b) {
-  return canonValue(a ?? null) === canonValue(b ?? null);
-}
-
-// True when an after_unknown subtree marks any value as unknown.
-function hasAnyTrue(v) {
-  if (v === true) return true;
-  if (Array.isArray(v)) return v.some(hasAnyTrue);
-  if (isPlainObject(v)) return Object.values(v).some(hasAnyTrue);
-  return false;
-}
-
-// Keep values small enough to ship: raw value when short, truncated text otherwise.
-function truncateTfValue(v) {
-  const s = canonValue(v ?? null);
-  if (s.length <= TF_MAX_ATTR_VALUE_CHARS) return v === undefined ? null : v;
-  return typeof v === 'string' ? `${v.slice(0, TF_MAX_ATTR_VALUE_CHARS)}…` : `${s.slice(0, TF_MAX_ATTR_VALUE_CHARS)}…`;
-}
-
-function joinAttrPath(prefix, key) {
-  return prefix ? `${prefix}.${key}` : key;
-}
-
-// Walk change.before / change.after in parallel and record every attribute whose
-// value differs (or that is only known after apply, per change.after_unknown).
-// Objects recurse over the union of keys; arrays recurse per index. `out` is
-// capped at TF_MAX_ATTR_CHANGES entries.
-function diffTfAttributes(before, after, unknown, out, prefix) {
-  if (out.length >= TF_MAX_ATTR_CHANGES) return;
-  const b = before ?? null;
-  const a = after ?? null;
-
-  // Both plain objects → recurse over the union of keys.
-  if (isPlainObject(b) && isPlainObject(a)) {
-    for (const key of new Set([...Object.keys(b), ...Object.keys(a)])) {
-      diffTfAttributes(b[key], a[key], unknown?.[key], out, joinAttrPath(prefix, key));
-    }
-    return;
-  }
-  // One side an object and the other absent → recurse into the present one so
-  // each attribute gets its own row (whole-block create/destroy).
-  if ((isPlainObject(b) && a === null) || (isPlainObject(a) && b === null)) {
-    const obj = isPlainObject(b) ? b : a;
-    for (const key of Object.keys(obj)) {
-      if (isPlainObject(b)) diffTfAttributes(obj[key], undefined, unknown?.[key], out, joinAttrPath(prefix, key));
-      else diffTfAttributes(undefined, obj[key], unknown?.[key], out, joinAttrPath(prefix, key));
-    }
-    return;
-  }
-  // Both arrays → recurse per index (plan lists are positionally stable).
-  if (Array.isArray(b) && Array.isArray(a)) {
-    const len = Math.max(b.length, a.length);
-    for (let i = 0; i < len; i++) diffTfAttributes(b[i], a[i], unknown?.[i], out, `${prefix}[${i}]`);
-    return;
-  }
-  // One side an array and the other absent → same treatment as objects.
-  if ((Array.isArray(b) && a === null) || (Array.isArray(a) && b === null)) {
-    const arr = Array.isArray(b) ? b : a;
-    for (let i = 0; i < arr.length; i++) {
-      if (Array.isArray(b)) diffTfAttributes(arr[i], undefined, unknown?.[i], out, `${prefix}[${i}]`);
-      else diffTfAttributes(undefined, arr[i], unknown?.[i], out, `${prefix}[${i}]`);
-    }
-    return;
-  }
-  // Both sides absent but the unknown structure names attributes (the whole block
-  // is only known after apply) → give each attribute its own row.
-  if (b === null && a === null && (isPlainObject(unknown) || Array.isArray(unknown))) {
-    if (Array.isArray(unknown)) {
-      for (let i = 0; i < unknown.length; i++) diffTfAttributes(undefined, undefined, unknown[i], out, `${prefix}[${i}]`);
-    } else {
-      for (const key of Object.keys(unknown)) diffTfAttributes(undefined, undefined, unknown[key], out, joinAttrPath(prefix, key));
-    }
-    return;
-  }
-
-  // Leaf: record when the values differ or the value is only known after apply.
-  const unknownHere = hasAnyTrue(unknown);
-  if (!tfValueEqual(b, a) || unknownHere) {
-    out.push({
-      path: prefix,
-      before: truncateTfValue(b),
-      after: unknownHere ? null : truncateTfValue(a),
-      ...(unknownHere ? { unknown: true } : {}),
-    });
-  }
-}
-
-// Parse `terraform plan -json` NDJSON output into a change summary and a
-// per-resource list (with attribute-level diffs). Non-JSON lines (progress text)
-// are skipped; if nothing parses, the caller falls back to showing the raw output.
-function parsePlanJson(stdout) {
-  const resources = [];
+// Parse terraform's text-mode plan output into per-action counts. The canonical
+// per-resource header lines ("# addr will be created", ...) are counted first;
+// when none are present (e.g. a clean "No changes." run) the final
+// "Plan: X to add, Y to change, Z to destroy." line is used instead — there,
+// replaces count as changes. Returns null when neither is found (the plan
+// errored before printing any summary).
+function parsePlanText(stdout) {
   const summary = { add: 0, update: 0, replace: 0, destroy: 0 };
+  let sawHeader = false;
   for (const line of stdout.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('{')) continue;
-    let obj;
-    try {
-      obj = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-    if (obj.type !== 'resource_change' || !Array.isArray(obj.change?.actions)) continue;
-    const actions = obj.change.actions;
-    const creates = actions.includes('create');
-    const deletes = actions.includes('delete');
-    if (creates && deletes) summary.replace += 1;
-    else if (creates) summary.add += 1;
-    else if (deletes) summary.destroy += 1;
-    else if (actions.includes('update')) summary.update += 1;
-    if (resources.length < TF_MAX_PLAN_RESOURCES) {
-      const changes = [];
-      diffTfAttributes(obj.change?.before, obj.change?.after, obj.change?.after_unknown, changes, '');
-      resources.push({
-        address: typeof obj.address === 'string' ? obj.address : '',
-        type: obj.resource?.type ?? '',
-        name: obj.resource?.name ?? '',
-        actions,
-        changes,
-      });
+    let action = null;
+    if (/^\s*#\s+.+ will be created\s*$/.test(line)) action = 'add';
+    else if (/^\s*#\s+.+ will be updated in-place\s*$/.test(line)) action = 'update';
+    else if (/^\s*#\s+.+ must be replaced\s*$/.test(line)) action = 'replace';
+    else if (/^\s*#\s+.+ will be destroyed\s*$/.test(line)) action = 'destroy';
+    if (action !== null) {
+      summary[action] += 1;
+      sawHeader = true;
     }
   }
-  return { summary, resources };
+  const m = stdout.match(/^Plan: (\d+) to add, (\d+) to change, (\d+) to destroy\./m);
+  if (sawHeader && (!m || (summary.add + summary.replace === Number(m[1]) &&
+      summary.update === Number(m[2]) && summary.destroy + summary.replace === Number(m[3])))) return summary;
+  if (m) return { add: Number(m[1]), update: Number(m[2]), replace: 0, destroy: Number(m[3]) };
+  if (sawHeader) return summary;
+  if (/^No changes\./m.test(stdout)) return { add: 0, update: 0, replace: 0, destroy: 0 };
+  return null;
 }
 
 // --- Dependency graph (`terraform graph` DOT output) ------------------------
@@ -1098,7 +1016,7 @@ function parseTfVersions(output) {
 //   { error: 'enoent' | message, ... } when the binary cannot be started
 // When onChunk is given it receives each raw stdout/stderr chunk as it arrives.
 // When stdin (a string) is given it is written to the child's stdin and closed.
-function spawnCaptured(file, args, cwd, timeoutMs, env = process.env, onChunk, stdin) {
+function spawnCaptured(file, args, cwd, timeoutMs, env = process.env, onChunk, stdin, maxBytes = Infinity) {
   return new Promise(resolve => {
     let settled = false;
     const finish = (result) => {
@@ -1110,6 +1028,8 @@ function spawnCaptured(file, args, cwd, timeoutMs, env = process.env, onChunk, s
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let tooLarge = false;
+    let outputBytes = 0;
     let child;
     try {
       child = spawn(file, args, { cwd, env });
@@ -1126,15 +1046,26 @@ function spawnCaptured(file, args, cwd, timeoutMs, env = process.env, onChunk, s
       timedOut = true;
       child.kill('SIGKILL');
     }, timeoutMs);
-    child.stdout.on('data', d => { const s = d.toString(); stdout += s; if (onChunk) onChunk(s); });
-    child.stderr.on('data', d => { const s = d.toString(); stderr += s; if (onChunk) onChunk(s); });
+    const capture = (d, isStderr) => {
+      outputBytes += d.length;
+      if (outputBytes > maxBytes) {
+        tooLarge = true;
+        child.kill('SIGKILL');
+        return;
+      }
+      const s = d.toString();
+      if (isStderr) stderr += s; else stdout += s;
+      if (onChunk) onChunk(s);
+    };
+    child.stdout.on('data', d => capture(d, false));
+    child.stderr.on('data', d => capture(d, true));
     child.on('error', err => {
       clearTimeout(timer);
       finish({ error: err.code === 'ENOENT' ? 'enoent' : err.message, timedOut: false, stdout, stderr });
     });
     child.on('close', code => {
       clearTimeout(timer);
-      finish({ exitCode: code, timedOut, stdout, stderr });
+      finish({ ...(tooLarge ? { error: 'output-too-large' } : {}), exitCode: code, timedOut, stdout, stderr });
     });
   });
 }
@@ -1143,13 +1074,13 @@ function spawnCaptured(file, args, cwd, timeoutMs, env = process.env, onChunk, s
 // onChunk (optional) receives raw stdout/stderr chunks as it arrives; stdin
 // (optional string) is piped to the process (used by console-eval); extraEnv
 // (optional object) adds per-run environment variables (cloud credentials).
-function runTerraform(cwd, args, onChunk, stdin, extraEnv) {
+function runTerraform(cwd, args, onChunk, stdin, extraEnv, maxBytes) {
   const binDir = tfenvBinDir();
   const baseEnv = binDir
     ? { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}` }
     : process.env;
   const env = extraEnv && Object.keys(extraEnv).length > 0 ? { ...baseEnv, ...extraEnv } : baseEnv;
-  return spawnCaptured('terraform', args, cwd, TF_TIMEOUT_MS, env, onChunk, stdin);
+  return spawnCaptured('terraform', args, cwd, TF_TIMEOUT_MS, env, onChunk, stdin, maxBytes);
 }
 
 // Run a tfenv subcommand (list / version-name / install) and resolve with output.
@@ -1215,6 +1146,15 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
 
   const args = buildTfArgs(command, opts);
   const stdin = command === 'console-eval' ? `${opts.expression}\n` : undefined;
+  let previewDir = null;
+  if (command === 'plan') {
+    try {
+      previewDir = fs.mkdtempSync(path.join(os.tmpdir(), 'terracode-plan-'));
+      args.push(`-out=${path.join(previewDir, 'plan')}`);
+    } catch {
+      return { statusCode: 500, body: { error: 'Could not prepare a private plan preview' } };
+    }
+  }
 
   // Inject cloud credentials as environment variables for this run only. Only
   // providers with an active login session are included (see the credential
@@ -1224,7 +1164,16 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
     setCredUnlock(credUnlockedPayload); // refresh on use
   }
 
-  const result = await runTerraform(dir, args, onChunk, stdin, Object.keys(credEnv).length > 0 ? credEnv : undefined);
+  let result;
+  let previewId = null;
+  try {
+    result = await runTerraform(dir, args, onChunk, stdin, Object.keys(credEnv).length > 0 ? credEnv : undefined);
+    if (previewDir && !result.error && !result.timedOut && result.exitCode === 0) {
+      previewId = rememberTfPreview(dir, path.join(previewDir, 'plan'));
+    }
+  } finally {
+    if (previewDir) fs.rmSync(previewDir, { recursive: true, force: true });
+  }
   if (result.error === 'enoent') {
     return { statusCode: 503, body: { error: 'terraform executable not found in PATH' } };
   }
@@ -1254,67 +1203,20 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
     return { statusCode: 200, body };
   }
 
-  if (command === 'validate') {
-    let parsed;
-    try {
-      parsed = JSON.parse(result.stdout);
-    } catch {
-      // e.g. terraform too old for -json; surface the raw output as a diagnostic
-      return {
-        statusCode: 200,
-        body: {
-          command: 'validate',
-          valid: false,
-          errorCount: 1,
-          warningCount: 0,
-          diagnostics: [{
-            level: 'error',
-            summary: 'Could not parse terraform validate output',
-            detail: (result.stdout + result.stderr).slice(0, 4000),
-          }],
-        },
-      };
-    }
-    return {
-      statusCode: 200,
-      body: {
-        command: 'validate',
-        valid: Boolean(parsed.valid),
-        errorCount: parsed.error_count ?? 0,
-        warningCount: parsed.warning_count ?? 0,
-        diagnostics: Array.isArray(parsed.diagnostics) ? parsed.diagnostics : [],
-      },
-    };
-  }
-
-  if (command === 'plan-json') {
+  if (command === 'plan' || command === 'drift') {
     let parsed = null;
     try {
-      parsed = parsePlanJson(result.stdout);
+      parsed = parsePlanText(result.stdout);
     } catch {
-      // malformed stream; fall back to raw output below
-    }
-    return {
-      statusCode: 200,
-      body: {
-        command: 'plan-json',
-        exitCode: result.timedOut ? null : result.exitCode,
-        timedOut: result.timedOut,
-        summary: parsed?.summary ?? null,
-        resources: parsed?.resources ?? [],
-        output: tfOutputText(result),
-      },
-    };
-  }
-
-  if (command === 'drift') {
-    let parsed = null;
-    try {
-      parsed = parsePlanJson(result.stdout);
-    } catch {
-      // malformed stream; the raw output below still shows what happened
+      // unparseable output; the raw text below still shows what happened
     }
     const exitCode = result.timedOut ? null : result.exitCode;
+    if (command === 'plan') {
+      return {
+        statusCode: 200,
+        body: { command: 'plan', exitCode, timedOut: result.timedOut, summary: parsed, output: tfOutputText(result), previewId },
+      };
+    }
     // -detailed-exitcode: 0 = state matches reality, 2 = changes detected.
     // Any other code (or a timeout) means the check itself failed -> null.
     let drifted = null;
@@ -1322,15 +1224,7 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
     else if (exitCode === 2) drifted = true;
     return {
       statusCode: 200,
-      body: {
-        command: 'drift',
-        exitCode,
-        timedOut: result.timedOut,
-        drifted,
-        summary: parsed?.summary ?? null,
-        resources: parsed?.resources ?? [],
-        output: tfOutputText(result),
-      },
+      body: { command: 'drift', exitCode, timedOut: result.timedOut, drifted, summary: parsed, output: tfOutputText(result) },
     };
   }
 
@@ -1349,25 +1243,6 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
         timedOut: result.timedOut,
         nodes: graph.nodes,
         edges: graph.edges,
-        output: tfOutputText(result),
-      },
-    };
-  }
-
-  if (command === 'output') {
-    let outputs = null;
-    try {
-      outputs = JSON.parse(result.stdout);
-    } catch {
-      // e.g. terraform too old for -json; raw output is returned alongside
-    }
-    return {
-      statusCode: 200,
-      body: {
-        command: 'output',
-        exitCode: result.timedOut ? null : result.exitCode,
-        timedOut: result.timedOut,
-        outputs,
         output: tfOutputText(result),
       },
     };
@@ -1394,25 +1269,17 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
   }
 
   if (command === 'version') {
-    let parsed = null;
-    try {
-      parsed = JSON.parse(result.stdout);
-    } catch {
-      // terraform < 1.6 has no `version -json`; fall back to text parsing below
-    }
-    let version = isPlainObject(parsed) && typeof parsed.terraform_version === 'string' ? parsed.terraform_version : null;
-    if (!version) {
-      const m = result.stdout.match(/^Terraform (v[\d][\w.-]*)/m);
-      if (m) version = m[1].slice(1);
-    }
+    // Text mode: "Terraform v1.9.8" / "on linux_amd64".
+    const vm = result.stdout.match(/^Terraform (v[\d][\w.-]*)/m);
+    const pm = result.stdout.match(/^on (\S+)/m);
     return {
       statusCode: 200,
       body: {
         command: 'version',
         exitCode: result.timedOut ? null : result.exitCode,
         timedOut: result.timedOut,
-        version,
-        platform: isPlainObject(parsed) && typeof parsed.platform === 'string' ? parsed.platform : null,
+        version: vm ? vm[1].slice(1) : null,
+        platform: pm ? pm[1] : null,
         output: tfOutputText(result),
       },
     };
@@ -1442,8 +1309,8 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
     };
   }
 
-  // plan, init, state-show, workspace-new/select, show-plan, import, state-mv/rm,
-  // console-eval and the guarded apply/destroy flows return their raw text.
+  // validate, output, init, state-show, workspace-new/select, show-plan, import,
+  // state-mv/rm, console-eval and the guarded apply/destroy flows return raw text.
   const body = {
     command,
     exitCode: result.timedOut ? null : result.exitCode,
@@ -1838,7 +1705,36 @@ const CRED_PROVIDERS = {
     ['serviceAccountJson', 65536],
     ['projectId', 128], // GOOGLE_CLOUD_PROJECT / GCLOUD_PROJECT; empty = key's own project
   ],
+  github: [
+    ['username', 128],
+    ['token', 512], // personal access token (required when 2FA is on — passwords never work)
+    ['host', 253], // self-hosted instance host; empty = github.com
+  ],
+  gitlab: [
+    ['username', 128],
+    ['token', 512], // personal access token (required when 2FA is on — passwords never work)
+    ['host', 253], // self-hosted instance host; empty = gitlab.com
+  ],
 };
+
+// Default public hosts for the git credential providers (used when a stored
+// entry leaves `host` empty). Git credentials are consumed by push/pull/fetch
+// via GIT_ASKPASS — never by cloud logins or terraform env injection.
+const GIT_CRED_PROVIDERS = { github: 'github.com', gitlab: 'gitlab.com' };
+
+function gitCredentialMetadata(creds) {
+  const metadata = {};
+  for (const [provider, defaultHost] of Object.entries(GIT_CRED_PROVIDERS)) {
+    const entry = creds[provider];
+    if (!entry) continue;
+    metadata[provider] = {
+      username: typeof entry.username === 'string' ? entry.username : '',
+      host: typeof entry.host === 'string' && entry.host.trim() !== '' ? entry.host.trim().toLowerCase() : defaultHost,
+      hasToken: typeof entry.token === 'string' && entry.token !== '',
+    };
+  }
+  return metadata;
+}
 
 // Global store location (system settings scope, never inside a project).
 function credHomeDir() {
@@ -1892,6 +1788,11 @@ function normalizeCredentials(raw, allowEmpty = false) {
       return { error: 'gcp.serviceAccountJson must be a valid service-account key (JSON object)' };
     }
   }
+  for (const provider of ['github', 'gitlab']) {
+    if (creds[provider]?.host && normalizeGitHost(creds[provider].host) === null) {
+      return { error: `${provider}.host must be a hostname with an optional port` };
+    }
+  }
   const providers = Object.keys(creds);
   if (providers.length === 0 && !allowEmpty) return { error: 'Provide at least one credential field' };
   return { creds, providers };
@@ -1919,6 +1820,9 @@ function encryptCredFile(creds, providers, passphrase) {
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const plaintext = Buffer.from(JSON.stringify(creds), 'utf-8');
   const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  // Non-sensitive git identifiers (username/host only — never tokens) so the UI
+  // can show what is stored without decrypting; survives restarts and lock state.
+  const gitMeta = gitCredentialMetadata(creds);
   return {
     v: 1,
     kdf: { name: 'scrypt', N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P },
@@ -1926,9 +1830,9 @@ function encryptCredFile(creds, providers, passphrase) {
     iv: iv.toString('hex'),
     ct: ct.toString('hex'),
     tag: cipher.getAuthTag().toString('hex'),
-    // Non-sensitive metadata only (which providers are configured) so the UI can
-    // show status without decrypting. Never contains credential values.
-    meta: { providers },
+    // Non-sensitive metadata only so the UI can show status without decrypting.
+    // Never contains credential values (tokens stay inside the ciphertext).
+    meta: { providers, git: gitMeta },
   };
 }
 
@@ -1982,31 +1886,53 @@ function writeCredFile(fileObj) {
 // In-memory unlocked store (never persisted): single global payload + expiry.
 let credUnlockedPayload = null;
 let credUnlockExpiry = 0;
+let credUnlockTimer = null;
+let credLockGeneration = 0;
+
+// Sessions contain provider identities, not secrets. A pending login must not
+// be allowed to restore a session after a lock, logout, or credential change.
+const cloudSessions = new Map();
+const cloudLoginGenerations = new Map();
+
+function invalidateCloudLogin(provider) {
+  const generation = (cloudLoginGenerations.get(provider) ?? 0) + 1;
+  cloudLoginGenerations.set(provider, generation);
+  return generation;
+}
 
 function credUnlockEntry() {
   if (credUnlockedPayload === null) return null;
-  if (Date.now() > credUnlockExpiry) {
-    credUnlockedPayload = null; // lazy TTL expiry
-    credUnlockExpiry = 0;
+  if (Date.now() >= credUnlockExpiry) {
+    clearCredUnlock();
     return null;
   }
   return credUnlockedPayload;
 }
 
+function scheduleCredExpiry() {
+  const delay = Math.max(1, Math.min(credUnlockExpiry - Date.now(), 2_147_483_647));
+  credUnlockTimer = setTimeout(() => {
+    if (Date.now() >= credUnlockExpiry) clearCredUnlock();
+    else scheduleCredExpiry();
+  }, delay);
+  credUnlockTimer.unref();
+}
+
 function setCredUnlock(payload) {
+  if (credUnlockTimer !== null) clearTimeout(credUnlockTimer);
   credUnlockedPayload = payload;
   credUnlockExpiry = Date.now() + CRED_UNLOCK_TTL_MS;
+  scheduleCredExpiry();
 }
 
 function clearCredUnlock() {
+  if (credUnlockTimer !== null) clearTimeout(credUnlockTimer);
+  credUnlockTimer = null;
   credUnlockedPayload = null;
   credUnlockExpiry = 0;
+  credLockGeneration += 1;
+  cloudSessions.clear();
 }
-
-// Active cloud login sessions (never persisted): provider -> session info.
-// A session exists only after a real, successful authentication against the
-// cloud service; it is what gates credential injection into terraform runs.
-const cloudSessions = new Map();
 
 // --- Cloud CLI helpers --------------------------------------------------------
 
@@ -2227,12 +2153,26 @@ function buildCloudEnv() {
 // returns credential values — only which providers are configured, whether the
 // store is unlocked, and which logins are currently active.
 app.get('/api/cloud/status', (req, res) => {
+  res.set('Cache-Control', 'no-store');
   const fileObj = readCredFile();
+  const unlocked = credUnlockEntry() !== null;
+  // Non-secret identifiers only, and only while unlocked (decryption required).
+  // Lets the UI confirm what is stored after an unlock. Never includes secrets.
+  let details;
+  if (unlocked) {
+    const payload = credUnlockEntry();
+    details = {};
+    if (payload.aws) details.aws = { accessKeyId: payload.aws.accessKeyId ?? '', region: payload.aws.region ?? '', hasSecretAccessKey: Boolean(payload.aws.secretAccessKey), hasSessionToken: Boolean(payload.aws.sessionToken) };
+    if (payload.azure) details.azure = { clientId: payload.azure.clientId ?? '', tenantId: payload.azure.tenantId ?? '', subscriptionId: payload.azure.subscriptionId ?? '' };
+    if (payload.gcp) details.gcp = { projectId: payload.gcp.projectId ?? '' };
+  }
   res.json({
     exists: fileObj !== null,
     providers: fileObj !== null && Array.isArray(fileObj.meta?.providers) ? fileObj.meta.providers : [],
-    unlocked: credUnlockEntry() !== null,
-    sessions: Object.fromEntries(cloudSessions),
+    unlocked,
+    sessions: unlocked ? Object.fromEntries(cloudSessions) : {},
+    ...(unlocked ? { unlockedUntil: credUnlockExpiry } : {}),
+    ...(details ? { details } : {}),
   });
 });
 
@@ -2250,12 +2190,14 @@ app.post('/api/cloud/credentials', (req, res) => {
 
   const statusPayload = () => {
     const fileObj = readCredFile();
+    const unlocked = credUnlockEntry() !== null;
     return {
       ok: true,
       exists: fileObj !== null,
       providers: fileObj !== null && Array.isArray(fileObj.meta?.providers) ? fileObj.meta.providers : [],
-      unlocked: credUnlockEntry() !== null,
-      sessions: Object.fromEntries(cloudSessions),
+      unlocked,
+      sessions: unlocked ? Object.fromEntries(cloudSessions) : {},
+      ...(unlocked ? { unlockedUntil: credUnlockExpiry } : {}),
     };
   };
 
@@ -2266,6 +2208,7 @@ app.post('/api/cloud/credentials', (req, res) => {
     const existing = readCredFile();
 
     let next; // normalized credential payload to persist
+    let old = null;
     if (action === 'create') {
       if (existing !== null) {
         return res.status(409).json({ error: 'Cloud credentials are already registered — use update instead' });
@@ -2275,13 +2218,16 @@ app.post('/api/cloud/credentials', (req, res) => {
       next = normalized.creds;
     } else {
       if (existing === null) return res.status(404).json({ error: 'No cloud credentials are registered yet' });
-      const old = decryptCredPayload(existing, body.passphrase);
+      old = decryptCredPayload(existing, body.passphrase);
       if (old === null) return res.status(401).json({ error: 'Wrong passphrase' });
 
-      // Merge semantics: providers with filled-in fields replace their stored
-      // block; listed providers are removed; everything else is kept as-is.
-      const normalized = normalizeCredentials(body.credentials ?? {}, true);
-      if (normalized.error) return res.status(400).json({ error: normalized.error });
+      // Partial updates preserve omitted fields, including stored secrets.
+      const changes = body.credentials ?? {};
+      if (!isPlainObject(changes)) return res.status(400).json({ error: 'credentials must be an object' });
+      for (const provider of Object.keys(changes)) {
+        if (!Object.hasOwn(CRED_PROVIDERS, provider)) return res.status(400).json({ error: `Unknown credential provider "${provider}"` });
+        if (!isPlainObject(changes[provider])) return res.status(400).json({ error: `${provider} credentials must be an object` });
+      }
       next = { ...old };
       for (const provider of Object.keys(next)) {
         if (!Object.hasOwn(CRED_PROVIDERS, provider)) delete next[provider]; // drop unknown legacy keys
@@ -2293,9 +2239,11 @@ app.post('/api/cloud/credentials', (req, res) => {
         }
         delete next[p];
       }
-      for (const [provider, block] of Object.entries(normalized.creds)) next[provider] = block;
-      if (Object.keys(next).length === 0) {
-        return res.status(400).json({ error: 'At least one provider must remain — use delete to remove the whole store' });
+      for (const [provider, block] of Object.entries(changes)) {
+        if (removeList.includes(provider)) return res.status(400).json({ error: `Cannot update and remove ${provider} together` });
+        const normalized = normalizeCredentials({ [provider]: { ...(old[provider] ?? {}), ...block } }, true);
+        if (normalized.error) return res.status(400).json({ error: normalized.error });
+        if (normalized.creds[provider]) next[provider] = normalized.creds[provider];
       }
     }
 
@@ -2304,9 +2252,18 @@ app.post('/api/cloud/credentials', (req, res) => {
     } catch (err) {
       return res.status(500).json({ error: 'Failed to save credentials', details: err.message });
     }
-    // Keep an active unlock alive with the fresh values; otherwise stay locked.
-    if (credUnlockEntry() !== null) setCredUnlock(next);
-    else clearCredUnlock();
+    if (action === 'update') {
+      for (const provider of ['aws', 'azure', 'gcp']) {
+        if (JSON.stringify(old[provider]) !== JSON.stringify(next[provider])) {
+          invalidateCloudLogin(provider);
+          cloudSessions.delete(provider);
+        }
+      }
+    }
+    // The caller just proved passphrase knowledge (or set a new one): leave the
+    // store unlocked so immediate follow-ups — test, login, git push/pull/fetch —
+    // work without re-entering the passphrase. The TTL still applies.
+    setCredUnlock(next);
     return res.json(statusPayload());
   }
 
@@ -2337,6 +2294,14 @@ app.post('/api/cloud/credentials', (req, res) => {
     const payload = decryptCredPayload(existing, body.passphrase);
     if (payload === null) return res.status(401).json({ error: 'Wrong passphrase' });
     setCredUnlock(payload);
+    // Backfill non-secret git metadata for stores written before it existed.
+    if (!isPlainObject(existing.meta?.git)) {
+      try {
+        writeCredFile(encryptCredFile(payload, Object.keys(payload), body.passphrase));
+      } catch {
+        // backfill is cosmetic; the unlock itself already succeeded
+      }
+    }
     return res.json(statusPayload());
   }
 
@@ -2355,12 +2320,12 @@ app.post('/api/cloud/credentials', (req, res) => {
       return res.status(401).json({ error: 'Wrong passphrase' });
     }
     try {
-      fs.rmSync(credHomeDir(), { recursive: true, force: true });
+      fs.rmSync(credStorePath(), { force: true });
+      fs.rmSync(path.join(credHomeDir(), 'gcp-key.json'), { force: true });
     } catch (err) {
       return res.status(500).json({ error: 'Failed to delete credentials', details: err.message });
     }
     clearCredUnlock();
-    cloudSessions.clear(); // no logins can survive the store being gone
     return res.json(statusPayload());
   }
 
@@ -2377,6 +2342,9 @@ app.post('/api/cloud/login', async (req, res) => {
   const provider = typeof body.provider === 'string' ? body.provider : '';
   if (!Object.hasOwn(CRED_PROVIDERS, provider)) {
     return res.status(400).json({ error: `provider must be one of ${Object.keys(CRED_PROVIDERS).join(', ')}` });
+  }
+  if (Object.hasOwn(GIT_CRED_PROVIDERS, provider)) {
+    return res.status(400).json({ error: `${provider} credentials are used automatically by git push/pull/fetch — no login needed` });
   }
 
   let payload = credUnlockEntry();
@@ -2395,17 +2363,25 @@ app.post('/api/cloud/login', async (req, res) => {
   const creds = payload[provider];
   if (!creds) return res.status(404).json({ error: `No ${provider} credentials are registered` });
 
+  const lockGeneration = credLockGeneration;
+  const loginGeneration = invalidateCloudLogin(provider);
   let outcome;
   try {
     outcome = provider === 'aws' ? await loginAws(creds) : provider === 'azure' ? await loginAzure(creds) : await loginGcp(creds);
   } catch (err) {
     return res.status(500).json({ error: `Login failed: ${err.message}` });
   }
+  // Check expiry first: it also invalidates sessions and pending logins.
+  const currentPayload = credUnlockEntry();
+  if (currentPayload === null || credLockGeneration !== lockGeneration ||
+      cloudLoginGenerations.get(provider) !== loginGeneration) {
+    return res.status(409).json({ error: 'Credential state changed while logging in — start login again' });
+  }
   if (outcome.error) return res.status(401).json({ error: outcome.error });
 
   const session = { loggedInAt: Date.now(), identity: outcome.identity, ...outcome };
   cloudSessions.set(provider, session);
-  setCredUnlock(payload); // a successful login keeps the store unlocked
+  setCredUnlock(currentPayload); // preserve unrelated credential updates
   res.json({ ok: true, provider, session });
 });
 
@@ -2417,6 +2393,7 @@ app.post('/api/cloud/logout', (req, res) => {
   if (!Object.hasOwn(CRED_PROVIDERS, provider)) {
     return res.status(400).json({ error: `provider must be one of ${Object.keys(CRED_PROVIDERS).join(', ')}` });
   }
+  invalidateCloudLogin(provider);
   cloudSessions.delete(provider);
   res.json({ ok: true, provider });
 });
@@ -2491,8 +2468,9 @@ function validateTfRun(command, source) {
   return { opts };
 }
 
-// API endpoint: run a whitelisted terraform command in a directory.
-// Fixed-arg commands: fmt | validate | plan | plan-json | init | init-upgrade |
+// API endpoint: run a whitelisted terraform command in a directory. All commands
+// run in text mode so the UI can show exactly what a shell would print.
+// Fixed-arg commands: fmt | validate | plan | drift | init | init-upgrade |
 //   output | state-list | version | workspace-list | show-plan | plan-file |
 //   apply | plan-file-destroy. Arg commands (validated): state-show,
 //   workspace-new/select, import, state-mv/rm, console-eval. Optional: varFile
@@ -2536,6 +2514,38 @@ app.post('/api/tf/run', (req, res) => {
     .finally(() => {
       tfRunning.delete(dir);
     });
+});
+
+// The raw JSON is requested explicitly: Terraform may include sensitive values.
+app.post('/api/tf/plan-json', async (req, res) => {
+  const body = req.body ?? {};
+  const id = typeof body.previewId === 'string' ? body.previewId : '';
+  if (!/^[a-f0-9]{32}$/.test(id)) return res.status(400).json({ error: 'Invalid plan preview' });
+  const dir = resolveTfDir(res, body.path);
+  if (!dir) return;
+  const preview = tfPreviews.get(id);
+  if (!preview || preview.dir !== dir || Date.now() >= preview.expiresAt) {
+    return res.status(404).json({ error: 'Plan preview expired — run Plan again' });
+  }
+  if (tfRunning.has(dir)) return res.status(409).json({ error: 'A terraform command is already running for this directory' });
+  tfRunning.add(dir);
+  let tempDir;
+  try {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'terracode-plan-'));
+    const file = path.join(tempDir, 'plan');
+    fs.writeFileSync(file, preview.bytes, { mode: 0o600 });
+    const result = await runTerraform(dir, ['show', '-json', file], undefined, undefined, undefined, TF_PREVIEW_MAX_BYTES);
+    if (result.error === 'output-too-large') return res.status(413).json({ error: 'Plan JSON exceeds the preview size limit' });
+    if (result.error || result.timedOut || result.exitCode !== 0) {
+      return res.status(result.timedOut ? 504 : 500).json({ error: 'Could not render the saved plan as JSON' });
+    }
+    try { JSON.parse(result.stdout); } catch { return res.status(500).json({ error: 'Terraform returned invalid plan JSON' }); }
+    res.set('Cache-Control', 'no-store');
+    return res.json({ rawJson: result.stdout });
+  } finally {
+    if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+    tfRunning.delete(dir);
+  }
 });
 
 // API endpoint: run a whitelisted terraform command and stream its output live.
@@ -2711,6 +2721,7 @@ app.post('/api/tf/install', (req, res) => {
 
 const GIT_TIMEOUT_MS = Number(process.env.GIT_TIMEOUT_MS) || 60_000;
 const GIT_NETWORK_TIMEOUT_MS = Number(process.env.GIT_NETWORK_TIMEOUT_MS) || 120_000; // push/pull/fetch
+const GIT_CRED_TEST_TIMEOUT_MS = Number(process.env.GIT_CRED_TEST_TIMEOUT_MS) || 15_000; // provider API check
 const GIT_MAX_STATUS_ENTRIES = 5000; // cap on parsed status records
 const GIT_MAX_COMMIT_FILES = 200; // cap on explicit file lists for git add
 const GIT_MAX_MESSAGE_LEN = 5000;
@@ -2779,8 +2790,102 @@ function repoWebUrl(url) {
   return null;
 }
 
-function runGit(cwd, args, timeoutMs = GIT_TIMEOUT_MS) {
-  return spawnCaptured('git', args, cwd, timeoutMs);
+// --- Git credential injection -------------------------------------------------
+// Tokens stay in this process. A per-operation loopback broker with a random
+// capability serves askpass; Git and its hooks do not inherit tokens in env.
+
+function normalizeGitHost(host) {
+  if (typeof host !== 'string' || host.trim() === '') return null;
+  const raw = host.trim();
+  if (/[\s/@?#\\]/.test(raw)) return null;
+  try {
+    const url = new URL(`https://${raw}`);
+    if (!url.hostname || url.username || url.password || url.pathname !== '/' || url.search || url.hash) return null;
+    return url.host.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function gitCredentialForPrompt(prompt) {
+  if (typeof prompt !== 'string') return null;
+  const match = prompt.match(/^(Username|Password) for ['"]?(https:\/\/[^'"\s]+)['"]?:\s*$/i);
+  if (!match) return null;
+  let url;
+  try { url = new URL(match[2]); } catch { return null; }
+  if (url.protocol !== 'https:') return null;
+  const payload = credUnlockEntry();
+  if (payload === null) return null;
+  for (const [provider, defaultHost] of Object.entries(GIT_CRED_PROVIDERS)) {
+    const creds = payload[provider];
+    if (!creds || typeof creds.token !== 'string' || creds.token === '') continue;
+    const host = creds.host?.trim() ? normalizeGitHost(creds.host) : defaultHost;
+    if (host !== url.host.toLowerCase()) continue;
+    return match[1].toLowerCase() === 'password' ? creds.token : (creds.username || null);
+  }
+  return null;
+}
+
+function shellQuote(value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'";
+}
+
+function writeGitAskpassScript(dir) {
+  const file = path.join(dir, 'askpass.sh');
+  const isSea = require('node:sea').isSea();
+  const helper = isSea ? '--terracode-git-askpass' : shellQuote(path.join(__dirname, 'scripts', 'git-askpass.cjs'));
+  fs.writeFileSync(file, `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${helper} "$@"\n`, { mode: 0o700 });
+  return file;
+}
+
+async function runGitNetwork(cwd, args, timeoutMs = GIT_NETWORK_TIMEOUT_MS) {
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  const payload = credUnlockEntry();
+  const available = payload && Object.keys(GIT_CRED_PROVIDERS).some(p => typeof payload[p]?.token === 'string' && payload[p].token !== '');
+  if (!available) return runGit(cwd, args, timeoutMs, env);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'terracode-git-'));
+  const key = crypto.randomBytes(32).toString('hex');
+  const clients = new Set();
+  const broker = net.createServer(client => {
+    clients.add(client);
+    client.on('close', () => clients.delete(client));
+    client.on('error', () => {});
+    client.setTimeout(5000, () => client.destroy());
+    let data = '';
+    client.on('data', chunk => {
+      data += chunk.toString();
+      if (data.length > 4096) return client.destroy();
+      if (!data.includes('\n')) return;
+      let value = null;
+      try {
+        const request = JSON.parse(data.split('\n')[0]);
+        if (typeof request.key === 'string' && request.key.length === key.length &&
+            crypto.timingSafeEqual(Buffer.from(request.key), Buffer.from(key))) value = gitCredentialForPrompt(request.prompt);
+      } catch { /* invalid request */ }
+      client.end(JSON.stringify({ value }));
+    });
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      broker.once('error', reject);
+      broker.listen(0, '127.0.0.1', () => { broker.removeListener('error', reject); resolve(); });
+    });
+    broker.on('error', () => {});
+    env.GIT_ASKPASS = writeGitAskpassScript(dir);
+    env.TERRACODE_GIT_PORT = String(broker.address().port);
+    env.TERRACODE_GIT_KEY = key;
+    env.LC_ALL = 'C';
+    return await runGit(cwd, args, timeoutMs, env);
+  } finally {
+    for (const client of clients) client.destroy();
+    if (broker.listening) await new Promise(resolve => broker.close(resolve));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function runGit(cwd, args, timeoutMs = GIT_TIMEOUT_MS, env) {
+  return spawnCaptured('git', args, cwd, timeoutMs, env);
 }
 
 // Parse `git log --pretty=format:%H%x00%h%x00%an%x00%ae%x00%aI%x00%s` output.
@@ -3539,6 +3644,88 @@ app.post('/api/git/rebase-step', async (req, res) => {
   }
 });
 
+// API endpoint: status of the git credential subset of the global encrypted
+// store — which providers are configured and whether it is unlocked. Never
+// returns credential values; management reuses /api/cloud/credentials.
+app.get('/api/git/credentials', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const fileObj = readCredFile();
+  const payload = credUnlockEntry();
+  const all = payload !== null ? Object.keys(payload) : fileObj !== null && Array.isArray(fileObj.meta?.providers) ? fileObj.meta.providers : [];
+  // Non-secret identifiers only (username/host/token presence) — safe to expose
+  // while locked; lets the UI show what is stored across restarts.
+  const gitMeta = payload !== null ? gitCredentialMetadata(payload) : fileObj !== null && isPlainObject(fileObj.meta?.git) ? fileObj.meta.git : {};
+  const unlocked = payload !== null;
+  res.json({
+    exists: fileObj !== null,
+    providers: all.filter(p => Object.hasOwn(GIT_CRED_PROVIDERS, p)),
+    unlocked,
+    ...(unlocked ? { unlockedUntil: credUnlockExpiry } : {}),
+    stored: gitMeta,
+  });
+});
+
+// API endpoint: verify GitHub/GitLab credentials against the provider's own
+// user API (github.com/api/v3/user, gitlab.com/api/v4/user or a self-hosted
+// instance). Inline values are used when given (test-before-save); otherwise
+// the stored entry is required and the store must be unlocked.
+app.post('/api/git/credentials/test', async (req, res) => {
+  const body = req.body ?? {};
+  const provider = typeof body.provider === 'string' ? body.provider : '';
+  if (!Object.hasOwn(GIT_CRED_PROVIDERS, provider)) {
+    return res.status(400).json({ error: `provider must be one of ${Object.keys(GIT_CRED_PROVIDERS).join(', ')}` });
+  }
+
+  let token = typeof body.token === 'string' ? body.token.trim() : '';
+  const requestedHost = typeof body.host === 'string' ? body.host.trim() : '';
+  let host = requestedHost ? normalizeGitHost(requestedHost) : '';
+  if (requestedHost && host === null) return res.status(400).json({ error: 'Invalid instance host' });
+
+  if (token === '') {
+    const payload = credUnlockEntry();
+    const stored = payload !== null ? payload[provider] : null;
+    if (!stored || typeof stored.token !== 'string' || stored.token === '') {
+      return res.status(401).json({ error: `No ${provider} credentials to test — fill in the form or unlock the store` });
+    }
+    token = stored.token;
+    const storedHost = stored.host?.trim() ? normalizeGitHost(stored.host) : GIT_CRED_PROVIDERS[provider];
+    if (storedHost === null) return res.status(400).json({ error: 'Invalid stored instance host' });
+    if (host && host !== storedHost) return res.status(400).json({ error: 'Stored credentials can only be tested against their registered host' });
+    host = storedHost;
+  }
+
+  const baseHost = host !== '' ? host : GIT_CRED_PROVIDERS[provider];
+  // github.com's REST API lives on api.github.com — the /api/v3 path on the web
+  // host answers 404 for everyone. Self-hosted GHE keeps /api/v3 on its own host.
+  const url =
+    provider === 'github'
+      ? baseHost === 'github.com'
+        ? 'https://api.github.com/user'
+        : `https://${baseHost}/api/v3/user`
+      : `https://${baseHost}/api/v4/user`;
+  const headers =
+    provider === 'github'
+      ? { Authorization: `Bearer ${token}`, 'User-Agent': 'terracode', Accept: 'application/json' }
+      : { 'PRIVATE-TOKEN': token, Accept: 'application/json' };
+
+  let upstream;
+  try {
+    upstream = await fetch(url, { headers, redirect: 'error', signal: AbortSignal.timeout(GIT_CRED_TEST_TIMEOUT_MS) });
+  } catch (err) {
+    return res.status(502).json({ error: `Connection to ${baseHost} failed: ${err.message}` });
+  }
+  if (!upstream.ok) {
+    const hint =
+      provider === 'github'
+        ? ' With 2FA enabled, account passwords never work over HTTPS — use a personal access token.'
+        : '';
+    return res.status(401).json({ error: `Authentication rejected by ${provider === 'github' ? 'GitHub' : 'GitLab'} (HTTP ${upstream.status}).${hint}` });
+  }
+  const data = await upstream.json().catch(() => null);
+  const identity = isPlainObject(data) ? String(data.login || data.username || '') : '';
+  res.json({ ok: true, provider, host: baseHost, identity: identity !== '' ? identity : 'authenticated' });
+});
+
 // API endpoint: initialize a repository in a folder (for imported/empty folders
 // with no .git) and optionally add an `origin` remote so the user can push to a
 // new GitHub/GitLab repo. Refuses if the path is already inside a work tree.
@@ -3622,11 +3809,27 @@ app.post('/api/git/push', async (req, res) => {
   }
   gitBusy.add(dir);
   try {
+    let pushBranch = branch;
+    if (pushBranch === null) {
+      // `git push -u origin` without a refspec fails on branches that have no
+      // upstream yet ("The current branch X has no upstream branch"): with only
+      // a remote name, push.default=simple needs an existing tracking config to
+      // infer the refspec. Passing the current branch explicitly pushes new
+      // branches and sets their upstream in one step. Detached HEAD reports
+      // "HEAD" — keep the legacy behavior there (no meaningful branch name).
+      const curRes = await runGit(dir, ['rev-parse', '--abbrev-ref', 'HEAD']);
+      if (curRes.error === 'enoent') {
+        return res.status(503).json({ error: 'git executable not found in PATH' });
+      }
+      const current = !curRes.error && !curRes.timedOut && curRes.exitCode === 0 ? (curRes.stdout || '').trim().split('\n')[0] : '';
+      if (current !== '' && current !== 'HEAD') pushBranch = current;
+    }
+
     const args = ['push'];
     if (setUpstream) args.push('-u');
     args.push('origin');
-    if (branch) args.push(branch);
-    const result = await runGit(dir, args, GIT_NETWORK_TIMEOUT_MS);
+    if (pushBranch) args.push(pushBranch);
+    const result = await runGitNetwork(dir, args, GIT_NETWORK_TIMEOUT_MS);
     if (result.error === 'enoent') {
       return res.status(503).json({ error: 'git executable not found in PATH' });
     }
@@ -3634,7 +3837,7 @@ app.post('/api/git/push', async (req, res) => {
       return res.status(result.timedOut ? 504 : 500).json({ error: 'git push failed', details: gitOutput(result), timedOut: Boolean(result.timedOut) });
     }
     const output = ((result.stdout || '') + (result.stderr ? `\n${result.stderr}` : '')).trim();
-    res.json({ success: result.exitCode === 0, branch: branch ?? undefined, output });
+    res.json({ success: result.exitCode === 0, branch: pushBranch ?? undefined, output });
   } finally {
     gitBusy.delete(dir);
   }
@@ -3660,7 +3863,7 @@ app.post('/api/git/pull', async (req, res) => {
   try {
     const args = ['pull'];
     if (branch) args.push('origin', branch);
-    const result = await runGit(dir, args, GIT_NETWORK_TIMEOUT_MS);
+    const result = await runGitNetwork(dir, args, GIT_NETWORK_TIMEOUT_MS);
     if (result.error === 'enoent') {
       return res.status(503).json({ error: 'git executable not found in PATH' });
     }
@@ -3689,7 +3892,7 @@ app.post('/api/git/fetch', async (req, res) => {
   }
   gitBusy.add(dir);
   try {
-    const result = await runGit(dir, ['fetch', '--all'], GIT_NETWORK_TIMEOUT_MS);
+    const result = await runGitNetwork(dir, ['fetch', '--all'], GIT_NETWORK_TIMEOUT_MS);
     if (result.error === 'enoent') {
       return res.status(503).json({ error: 'git executable not found in PATH' });
     }
