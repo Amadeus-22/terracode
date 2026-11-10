@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
+import { execFileSync } from 'node:child_process'
 
 // Fixture layout (created in beforeAll):
 //   base/
@@ -95,6 +96,12 @@ case "$1" in
     exit 1
     ;;
   plan)
+    # A FIFO lets tests edit the configuration while a plan is in progress.
+    if [ -p .plan-gate ]; then
+      cat main.tf > .plan-observed
+      : > .plan-ready
+      read -r _ < .plan-gate
+    fi
     if [ -f .slow-plan ]; then sleep 4; fi
     printf '%s\n' "$*" > .plan-args
     destroy=0
@@ -1506,6 +1513,150 @@ describe('POST /api/tf/run (lifecycle)', () => {
     return dir
   }
   const apply = (dir) => request(app).post('/api/tf/run').send({ command: 'apply', path: dir })
+
+  const waitForMarker = (file) => new Promise((resolve, reject) => {
+    let watcher
+    const timer = setTimeout(() => {
+      watcher?.close()
+      reject(new Error(`Timed out waiting for ${file}`))
+    }, 5000)
+    const check = () => {
+      if (!fs.existsSync(file)) return
+      clearTimeout(timer)
+      watcher.close()
+      resolve()
+    }
+    watcher = fs.watch(path.dirname(file), check)
+    check()
+  })
+
+  const editWhilePlanning = async (dir, command, edit) => {
+    const gate = path.join(dir, '.plan-gate')
+    execFileSync('mkfifo', [gate])
+    const ready = waitForMarker(path.join(dir, '.plan-ready'))
+    const planning = request(app).post('/api/tf/run').send({ command, path: dir }).then(res => res)
+    await ready
+    try {
+      expect(fs.readFileSync(path.join(dir, '.plan-observed'), 'utf-8')).toContain('resource "s" "t"')
+      edit()
+    } finally {
+      fs.writeFileSync(gate, 'continue\n')
+    }
+    await planning
+  }
+
+  it.each(['plan-file', 'plan-file-destroy'])('refuses %s when the configuration changes while planning', async (command) => {
+    const dir = await plannedProject(`stale-during-${command}`)
+    await editWhilePlanning(dir, command, () => {
+      fs.writeFileSync(path.join(dir, 'main.tf'), 'resource "s" "changed_during_plan" {}\n')
+    })
+    expect((await apply(dir)).status).toBe(409)
+    expect(fs.existsSync(path.join(dir, '.apply-log'))).toBe(false)
+  })
+
+  it.each(['restore file', 'create and remove file'])('refuses a plan when changes are reverted during planning: %s', async (scenario) => {
+    const dir = await plannedProject(`stale-during-revert-${scenario.replaceAll(' ', '-')}`)
+    await editWhilePlanning(dir, 'plan-file', () => {
+      const main = path.join(dir, 'main.tf')
+      const transient = path.join(dir, 'temporary.tf')
+      if (scenario === 'restore file') {
+        const original = fs.readFileSync(main, 'utf-8')
+        fs.writeFileSync(main, 'changed\n')
+        fs.writeFileSync(main, original)
+      } else {
+        fs.writeFileSync(transient, 'temporary\n')
+        fs.rmSync(transient)
+      }
+    })
+    expect((await apply(dir)).status).toBe(409)
+    expect(fs.existsSync(path.join(dir, '.apply-log'))).toBe(false)
+  })
+
+  it.each(['main.tf', 'selected.tfvars'])('tracks changes to symlinked %s files', async (name) => {
+    const dir = await plannedProject(`stale-symlink-${name}`)
+    const target = path.join(dir, 'linked-source.txt')
+    const link = path.join(dir, name)
+    fs.writeFileSync(target, 'original\n')
+    fs.rmSync(link, { force: true })
+    fs.symlinkSync(target, link)
+    expect((await request(app).post('/api/tf/run').send({ command: 'plan-file', path: dir })).status).toBe(200)
+    fs.writeFileSync(target, 'changed\n')
+    expect((await apply(dir)).status).toBe(409)
+    expect(fs.existsSync(path.join(dir, '.apply-log'))).toBe(false)
+  })
+
+  it('fails closed for configuration symlinks outside the allowed roots', async () => {
+    const dir = await plannedProject('stale-external-symlink')
+    fs.symlinkSync(path.join(base, 'outside.txt'), path.join(dir, 'external.tf'))
+    const res = await request(app).post('/api/tf/run').send({ command: 'plan-file', path: dir })
+    expect(res.status).toBe(409)
+    expect((await apply(dir)).status).toBe(409)
+  })
+
+  it('fails closed for broken configuration symlinks', async () => {
+    const dir = await plannedProject('stale-broken-symlink')
+    fs.symlinkSync('missing.txt', path.join(dir, 'broken.tf'))
+    const res = await request(app).post('/api/tf/run').send({ command: 'plan-file', path: dir })
+    expect(res.status).toBe(409)
+    expect((await apply(dir)).status).toBe(409)
+  })
+
+  it.each(['absolute', 'relative'])('tracks local modules with a %s TF_DATA_DIR', async (kind) => {
+    const previous = process.env.TF_DATA_DIR
+    const name = `stale-custom-data-dir-${kind}`
+    const dir = tfDir(name)
+    process.env.TF_DATA_DIR = kind === 'absolute' ? path.join(dir, '.custom-terraform') : '.custom-terraform'
+    try {
+      const modules = JSON.stringify({ Modules: [
+        { Key: '', Dir: '.' },
+        { Key: 'net', Source: './modules/net', Dir: 'modules/net' },
+      ] })
+      await plannedProject(name, {
+        'modules/net/main.tf': 'variable "cidr" {}\n',
+        '.custom-terraform/modules/modules.json': modules,
+      })
+      fs.writeFileSync(path.join(dir, 'modules/net/main.tf'), 'variable "cidr" { default = "changed" }\n')
+      expect((await apply(dir)).status).toBe(409)
+      expect(fs.existsSync(path.join(dir, '.apply-log'))).toBe(false)
+    } finally {
+      if (previous === undefined) delete process.env.TF_DATA_DIR
+      else process.env.TF_DATA_DIR = previous
+    }
+  })
+
+  it('fails closed if the module manifest becomes invalid', async () => {
+    const dir = await plannedProject('stale-invalid-manifest')
+    const manifest = path.join(dir, '.terraform/modules/modules.json')
+    fs.mkdirSync(path.dirname(manifest), { recursive: true })
+    fs.writeFileSync(manifest, '{invalid json')
+    expect((await apply(dir)).status).toBe(409)
+    expect(fs.existsSync(path.join(dir, '.apply-log'))).toBe(false)
+  })
+
+  it.each([
+    ['invalid json', '{invalid json'],
+    ['invalid module entry', JSON.stringify({ Modules: [{ Key: 'net', Source: './modules/net' }] })],
+  ])('fails closed before planning if the module manifest contains %s', async (_reason, contents) => {
+    const dir = await plannedProject(`stale-invalid-manifest-before-${_reason.replaceAll(' ', '-')}`)
+    const manifest = path.join(dir, '.terraform/modules/modules.json')
+    fs.mkdirSync(path.dirname(manifest), { recursive: true })
+    fs.writeFileSync(manifest, contents)
+    const res = await request(app).post('/api/tf/run').send({ command: 'plan-file', path: dir })
+    expect(res.status).toBe(409)
+    expect((await apply(dir)).status).toBe(409)
+  })
+
+  it.each(['plan-file', 'plan-file-destroy'])('reports a stale %s through the streaming endpoint', async (command) => {
+    const dir = await plannedProject(`stale-stream-${command}`)
+    if (command === 'plan-file-destroy') {
+      expect((await request(app).post('/api/tf/run').send({ command, path: dir })).status).toBe(200)
+    }
+    fs.writeFileSync(path.join(dir, 'main.tf'), 'resource "s" "changed" {}\n')
+    const res = await request(app).get('/api/tf/run-stream').query({ command: 'apply', path: dir })
+    expect(res.status).toBe(200)
+    expect(res.text).toContain('"status":409')
+    expect(fs.existsSync(path.join(dir, '.apply-log'))).toBe(false)
+  })
 
   it('refuses to apply a saved plan when a .tf file changed after it', async () => {
     const dir = await plannedProject('stale-edit')
