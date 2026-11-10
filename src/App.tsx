@@ -235,10 +235,10 @@ function App() {
     return () => window.removeEventListener('keydown', handler)
   }, [toggleLeftSidebar, toggleRightSidebar])
 
-  // Terraform Log view: the path whose log is open (null = closed). Derived per
-  // active file, so switching files closes it automatically without an effect.
+  // Terraform Log view: the active file path, or an empty string when no file
+  // is open (null = closed). Switching files closes the view automatically.
   const [tfLogPath, setTfLogPath] = useState<string | null>(null)
-  const tfLogOpen = tfLogPath === activePath && activePath !== ''
+  const tfLogOpen = tfLogPath === activePath
 
   // In-file search (Find): one open/closed state shared by the editor and the
   // read-only view. Driven by the Find button next to the drift badge, the
@@ -1060,12 +1060,16 @@ function App() {
         ) : (
           // No open tabs: the Terraform panel still renders — with the loaded
           // project if there is one, otherwise in "load a project" mode.
-          <div className="content-body">
+          <div className={`content-body${tfLogOpen ? ' tf-log-mode' : ''}`}>
             <TerraformPanel
               key={`empty:${tfProjectDir ?? 'none'}#${tfRootNonce}`}
               dirPath={tfProjectDir}
               projectDir={tfProjectDir}
               onLoadProject={handleLoadTfProject}
+              onFmtApplied={handleExternalChanges}
+              logOpen={tfLogOpen}
+              onToggleLog={() => setTfLogPath(p => (p === activePath ? null : activePath))}
+              onOpenLog={() => setTfLogPath(activePath)}
             />
           </div>
         )}
