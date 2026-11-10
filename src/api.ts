@@ -531,7 +531,8 @@ export type CloudStatus = {
   sessions: Partial<Record<CloudProvider, CloudSession>>
   // Non-secret identifiers, present only while the store is unlocked.
   details?: {
-    aws?: { accessKeyId: string; region: string; hasSecretAccessKey: boolean; hasSessionToken: boolean }
+    // Older local servers may not report whether secret fields are present.
+    aws?: { accessKeyId: string; region: string; hasSecretAccessKey?: boolean; hasSessionToken?: boolean }
     azure?: { clientId: string; tenantId: string; subscriptionId: string }
     gcp?: { projectId: string }
   }

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import request from 'supertest'
 import fs from 'node:fs'
 import http from 'node:http'
@@ -1869,6 +1869,7 @@ describe('cloud credentials & login (/api/cloud/*)', () => {
   it('reports no store and no sessions initially', async () => {
     const res = await request(app).get('/api/cloud/status')
     expect(res.status).toBe(200)
+    expect(res.headers['cache-control']).toBe('no-store')
     expect(res.body).toEqual({ exists: false, providers: [], unlocked: false, sessions: {} })
   })
 
@@ -1969,6 +1970,16 @@ describe('cloud credentials & login (/api/cloud/*)', () => {
     expect(cliLog('aws.log')).toContain('AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI')
   })
 
+  it('keeps the store unlocked after logout so login needs no passphrase', async () => {
+    const logout = await request(app).post('/api/cloud/logout').send({ provider: 'aws' })
+    expect(logout.status).toBe(200)
+    const status = await request(app).get('/api/cloud/status')
+    expect(status.body.unlocked).toBe(true)
+    expect(status.body.sessions.aws).toBeUndefined()
+    const login = await request(app).post('/api/cloud/login').send({ provider: 'aws' })
+    expect(login.status).toBe(200)
+  })
+
   it('rejects a login for an unregistered provider with 404', async () => {
     const res = await request(app).post('/api/cloud/login').send({ provider: 'azure' })
     expect(res.status).toBe(404)
@@ -2027,6 +2038,171 @@ describe('cloud credentials & login (/api/cloud/*)', () => {
     await request(app).post('/api/tf/run').send({ command: 'version', path: path.join(root, 'tf', 'creds') })
     const envText = credEnv() ?? ''
     expect(envText).not.toContain('AKIAEXAMPLE123')
+  })
+
+  it('does not restore prior cloud sessions when the store is unlocked', async () => {
+    const unlock = await request(app).post('/api/cloud/credentials').send({ action: 'unlock', passphrase: PASS })
+    expect(unlock.status).toBe(200)
+    expect(unlock.body.sessions).toEqual({})
+    const status = await request(app).get('/api/cloud/status')
+    expect(status.body.sessions).toEqual({})
+    await request(app).post('/api/tf/run').send({ command: 'version', path: path.join(root, 'tf', 'creds') })
+    expect(credEnv() ?? '').not.toContain('AKIAEXAMPLE123')
+    await request(app).post('/api/cloud/credentials').send({ action: 'lock' })
+  })
+
+  async function gatedAwsLogin(changeWhilePending) {
+    const gateDir = fs.mkdtempSync(path.join(base, 'aws-login-gate-'))
+    const ready = path.join(gateDir, 'ready')
+    const release = path.join(gateDir, 'release')
+    const bin = path.join(gateDir, 'aws')
+    fs.writeFileSync(bin, `#!/bin/bash\n: > "$FAKE_AWS_READY"\nwhile [ ! -e "$FAKE_AWS_RELEASE" ]; do sleep 0.02; done\nprintf '%s\\n' '{"Account":"123456789012","Arn":"arn:aws:iam::123456789012:user/test"}'\n`)
+    fs.chmodSync(bin, 0o700)
+    process.env.CLOUD_AWS_BIN = bin
+    process.env.FAKE_AWS_READY = ready
+    process.env.FAKE_AWS_RELEASE = release
+    const login = request(app).post('/api/cloud/login').send({ provider: 'aws', passphrase: PASS }).then(res => res)
+    try {
+      await vi.waitFor(() => expect(fs.existsSync(ready)).toBe(true), { timeout: 5000, interval: 20 })
+      await changeWhilePending()
+      fs.writeFileSync(release, 'release')
+      return await login
+    } finally {
+      fs.writeFileSync(release, 'release')
+      await login.catch(() => {})
+      delete process.env.CLOUD_AWS_BIN
+      delete process.env.FAKE_AWS_READY
+      delete process.env.FAKE_AWS_RELEASE
+      fs.rmSync(gateDir, { recursive: true, force: true })
+    }
+  }
+
+  it('does not allow an in-flight login to undo a subsequent lock', async () => {
+    const result = await gatedAwsLogin(async () => {
+      const lock = await request(app).post('/api/cloud/credentials').send({ action: 'lock' })
+      expect(lock.status).toBe(200)
+    })
+    expect(result.status).toBe(409)
+    const status = await request(app).get('/api/cloud/status')
+    expect(status.body.unlocked).toBe(false)
+    expect(status.body.sessions).toEqual({})
+  })
+
+  it('keeps a login invalidated even if the store is unlocked again', async () => {
+    const result = await gatedAwsLogin(async () => {
+      await request(app).post('/api/cloud/credentials').send({ action: 'lock' })
+      const unlock = await request(app).post('/api/cloud/credentials').send({ action: 'unlock', passphrase: PASS })
+      expect(unlock.status).toBe(200)
+    })
+    expect(result.status).toBe(409)
+    const status = await request(app).get('/api/cloud/status')
+    expect(status.body.unlocked).toBe(true)
+    expect(status.body.sessions).toEqual({})
+  })
+
+  it('does not allow an in-flight login to undo a subsequent logout', async () => {
+    const result = await gatedAwsLogin(async () => {
+      const logout = await request(app).post('/api/cloud/logout').send({ provider: 'aws' })
+      expect(logout.status).toBe(200)
+    })
+    expect(result.status).toBe(409)
+    const status = await request(app).get('/api/cloud/status')
+    expect(status.body.unlocked).toBe(true)
+    expect(status.body.sessions.aws).toBeUndefined()
+  })
+
+  it('does not accept an in-flight login after its AWS credentials change', async () => {
+    const result = await gatedAwsLogin(async () => {
+      const update = await request(app).post('/api/cloud/credentials').send({
+        action: 'update', passphrase: PASS, credentials: { aws: { region: 'us-test-1' } }
+      })
+      expect(update.status).toBe(200)
+    })
+    expect(result.status).toBe(409)
+    const status = await request(app).get('/api/cloud/status')
+    expect(status.body.sessions.aws).toBeUndefined()
+  })
+
+  it('preserves an in-flight AWS login when only Git credentials change', async () => {
+    const result = await gatedAwsLogin(async () => {
+      const update = await request(app).post('/api/cloud/credentials').send({
+        action: 'update', passphrase: PASS, credentials: { github: { username: 'dummy-user', token: 'dummy-token' } }
+      })
+      expect(update.status).toBe(200)
+    })
+    expect(result.status).toBe(200)
+    const status = await request(app).get('/api/cloud/status')
+    expect(status.body.sessions.aws.identity).toContain('user/test')
+    expect(status.body.providers).toContain('github')
+    const removeGit = await request(app).post('/api/cloud/credentials').send({
+      action: 'update', passphrase: PASS, credentials: {}, removeProviders: ['github']
+    })
+    expect(removeGit.status).toBe(200)
+    expect(removeGit.body.sessions.aws.identity).toContain('user/test')
+  })
+
+  it('does not cancel an AWS login when a different provider logs out', async () => {
+    const result = await gatedAwsLogin(async () => {
+      const logout = await request(app).post('/api/cloud/logout').send({ provider: 'azure' })
+      expect(logout.status).toBe(200)
+    })
+    expect(result.status).toBe(200)
+    const status = await request(app).get('/api/cloud/status')
+    expect(status.body.sessions.aws.identity).toContain('user/test')
+  })
+
+  it('keeps the newer session when two logins for one provider overlap', async () => {
+    const result = await gatedAwsLogin(async () => {
+      // The first login is already running against the gated fake CLI.
+      delete process.env.CLOUD_AWS_BIN
+      const newer = await request(app).post('/api/cloud/login').send({ provider: 'aws' })
+      expect(newer.status).toBe(200)
+    })
+    expect(result.status).toBe(409)
+    const status = await request(app).get('/api/cloud/status')
+    expect(status.body.sessions.aws.identity).toContain('user/test')
+  })
+
+  it('clears sessions when the unlocked store expires', async () => {
+    const originalNow = Date.now()
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(originalNow + 60 * 60_000)
+    try {
+      const expired = await request(app).get('/api/cloud/status')
+      expect(expired.body.unlocked).toBe(false)
+      expect(expired.body.sessions).toEqual({})
+    } finally {
+      clock.mockRestore()
+    }
+    const unlock = await request(app).post('/api/cloud/credentials').send({ action: 'unlock', passphrase: PASS })
+    expect(unlock.status).toBe(200)
+    expect(unlock.body.sessions).toEqual({})
+    await request(app).post('/api/cloud/credentials').send({ action: 'lock' })
+  })
+
+  it('expires the in-memory store on its timer even without a subsequent request', async () => {
+    const nativeTimeout = globalThis.setTimeout
+    const ttl = Number(process.env.CRED_UNLOCK_TTL_MS) || 15 * 60_000
+    let expire
+    const scheduler = vi.spyOn(globalThis, 'setTimeout').mockImplementation((callback, delay, ...args) => {
+      if (typeof delay === 'number' && delay >= Math.max(1, ttl - 1000) && delay <= ttl) expire = callback
+      return nativeTimeout(callback, delay, ...args)
+    })
+    try {
+      const login = await request(app).post('/api/cloud/login').send({ provider: 'aws', passphrase: PASS })
+      expect(login.status).toBe(200)
+      expect(typeof expire).toBe('function')
+      const beforeExpiry = Date.now()
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(beforeExpiry + ttl + 60_000)
+      try { expire() } finally { clock.mockRestore() }
+      // The clock is back before expiry: this only locks if the timer cleared it.
+      const status = await request(app).get('/api/cloud/status')
+      expect(status.body.unlocked).toBe(false)
+      const unlock = await request(app).post('/api/cloud/credentials').send({ action: 'unlock', passphrase: PASS })
+      expect(unlock.body.sessions).toEqual({})
+      await request(app).post('/api/cloud/credentials').send({ action: 'lock' })
+    } finally {
+      scheduler.mockRestore()
+    }
   })
 
   it('login reports a rejected AWS key without echoing the secret', async () => {
@@ -3341,6 +3517,7 @@ describe('git credentials (/api/git/credentials*)', () => {
   it('reports an empty git credential subset when nothing is stored', async () => {
     const res = await request(app).get('/api/git/credentials')
     expect(res.status).toBe(200)
+    expect(res.headers['cache-control']).toBe('no-store')
     expect(res.body).toEqual({ exists: false, providers: [], unlocked: false, stored: {} })
   })
 

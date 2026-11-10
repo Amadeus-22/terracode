@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactElement } from 'react'
+import { useEffect, useState, type ReactElement } from 'react'
 import {
   cloudCredentialAction,
   CREDENTIALS_CHANGED_EVENT,
@@ -6,11 +6,12 @@ import {
   GIT_CRED_PROVIDER_LABELS,
   testGitCredentials,
   type CloudCredentialsPayload,
-  type GitCredProvider,
-  type GitCredentialStatus
+  type GitCredProvider
 } from './api'
+import { useCredentialStatus } from './useCredentialStatus'
 
 type FormMode = 'status' | 'register' | 'edit'
+type Notice = { text: string; unlocked?: boolean }
 
 // One flat state for both providers so switching sections never loses values.
 type GitFields = {
@@ -46,7 +47,7 @@ function fieldsToPayload(f: GitFields, removed: GitCredProvider[]): CloudCredent
 // global encrypted store as the cloud credentials; while unlocked, git
 // push/pull/fetch authenticate against matching hosts automatically.
 const GitCredentials = (): ReactElement => {
-  const [status, setStatus] = useState<GitCredentialStatus | null>(null)
+  const { status, refresh } = useCredentialStatus(getGitCredentialStatus)
   const [mode, setMode] = useState<FormMode>('status')
   const [fields, setFields] = useState<GitFields>(EMPTY_FIELDS)
   // Providers to drop on save (edit mode only; the server keeps the rest).
@@ -57,36 +58,27 @@ const GitCredentials = (): ReactElement => {
   const [busy, setBusy] = useState(false)
   const [testing, setTesting] = useState<GitCredProvider | null>(null)
   const [error, setError] = useState('')
-  const [notice, setNotice] = useState('')
+  const [notice, setNotice] = useState<Notice | null>(null)
 
-  const refresh = useCallback(() => {
-    getGitCredentialStatus().then(setStatus).catch(() => setStatus(null))
+  useEffect(() => {
+    const clearNotice = () => setNotice(null)
+    const clearMessages = () => { clearNotice(); setError('') }
+    window.addEventListener(CREDENTIALS_CHANGED_EVENT, clearMessages)
+    window.addEventListener('focus', clearNotice)
+    return () => {
+      window.removeEventListener(CREDENTIALS_CHANGED_EVENT, clearMessages)
+      window.removeEventListener('focus', clearNotice)
+    }
   }, [])
 
-  useEffect(() => {
-    refresh()
-    window.addEventListener(CREDENTIALS_CHANGED_EVENT, refresh)
-    window.addEventListener('focus', refresh)
-    return () => {
-      window.removeEventListener(CREDENTIALS_CHANGED_EVENT, refresh)
-      window.removeEventListener('focus', refresh)
-    }
-  }, [refresh])
-
-  useEffect(() => {
-    if (!status?.unlockedUntil) return
-    const timer = window.setTimeout(refresh, Math.max(1, status.unlockedUntil - Date.now() + 50))
-    return () => window.clearTimeout(timer)
-  }, [refresh, status?.unlockedUntil])
-
   // Leaving any form discards typed secrets from state.
-  const exitForm = (next: FormMode, noticeText = '') => {
+  const exitForm = (next: FormMode, noticeText = '', unlocked?: boolean) => {
     setFields(EMPTY_FIELDS)
     setRemoveProviders([])
     setPass1('')
     setPass2('')
     setError('')
-    setNotice(noticeText)
+    setNotice(noticeText ? { text: noticeText, unlocked } : null)
     setMode(next)
   }
 
@@ -168,13 +160,13 @@ const GitCredentials = (): ReactElement => {
   const handleUnlock = async () => {
     if (busy || pass1 === '') return
     const ok = await act('unlock', { passphrase: pass1 })
-    if (ok) exitForm('status', 'Unlocked — git push/pull/fetch can now use the stored credentials.')
+    if (ok) exitForm('status', 'Unlocked — git push/pull/fetch can now use the stored credentials.', true)
   }
 
   const handleLock = async () => {
     if (busy) return
     const ok = await act('lock')
-    if (ok) exitForm('status', 'Locked — the in-memory copy was discarded.')
+    if (ok) exitForm('status', 'Locked — the in-memory copy was discarded.', false)
   }
 
   // Test with inline form values when present, otherwise the stored entry.
@@ -193,7 +185,7 @@ const GitCredentials = (): ReactElement => {
         throw new Error('Enter the token to test a different host before saving.')
       }
       const res = await testGitCredentials(provider, inline ? fieldsForProvider : undefined)
-      setNotice(`${GIT_CRED_PROVIDER_LABELS[provider]} OK — authenticated as ${res.identity} on ${res.host}.`)
+      setNotice({ text: `${GIT_CRED_PROVIDER_LABELS[provider]} OK — authenticated as ${res.identity} on ${res.host}.` })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Test failed')
       refresh()
@@ -402,7 +394,9 @@ const GitCredentials = (): ReactElement => {
       )}
 
       {error !== '' && <p className="tf-status error">{error}</p>}
-      {notice !== '' && <p className="tf-status ok">{notice}</p>}
+      {notice !== null && (notice.unlocked === undefined || notice.unlocked === status?.unlocked) && (
+        <p className="tf-status ok">{notice.text}</p>
+      )}
     </div>
   )
 }

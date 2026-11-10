@@ -1,15 +1,16 @@
-import { useCallback, useEffect, useState, type ReactElement } from 'react'
+import { useEffect, useState, type ReactElement } from 'react'
 import {
   CLOUD_PROVIDER_LABELS,
   CREDENTIALS_CHANGED_EVENT,
   cloudCredentialAction,
   getCloudStatus,
   type CloudCredentialsPayload,
-  type CloudProvider,
-  type CloudStatus
+  type CloudProvider
 } from './api'
+import { useCredentialStatus } from './useCredentialStatus'
 
 type FormMode = 'status' | 'register' | 'edit' | 'change-passphrase' | 'delete'
+type Notice = { text: string; unlocked?: boolean }
 
 // All credential fields in one flat state so switching between provider
 // sections never loses typed values.
@@ -70,7 +71,7 @@ function fieldsToPayload(f: CredFields, removed: CloudProvider[], clearSession: 
 // left sidebar). The store is global and encrypted; logging in against a cloud
 // happens from the Terraform panel's Login button.
 const CloudCredentials = (): ReactElement => {
-  const [status, setStatus] = useState<CloudStatus | null>(null)
+  const { status, refresh } = useCredentialStatus(getCloudStatus)
   const [mode, setMode] = useState<FormMode>('status')
   const [fields, setFields] = useState<CredFields>(EMPTY_FIELDS)
   // Providers to drop on save (edit mode only; the server keeps the rest).
@@ -81,37 +82,28 @@ const CloudCredentials = (): ReactElement => {
   const [pass2, setPass2] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [notice, setNotice] = useState('')
+  const [notice, setNotice] = useState<Notice | null>(null)
 
-  const refresh = useCallback(() => {
-    getCloudStatus().then(setStatus).catch(() => setStatus(null))
+  useEffect(() => {
+    const clearNotice = () => setNotice(null)
+    const clearMessages = () => { clearNotice(); setError('') }
+    window.addEventListener(CREDENTIALS_CHANGED_EVENT, clearMessages)
+    window.addEventListener('focus', clearNotice)
+    return () => {
+      window.removeEventListener(CREDENTIALS_CHANGED_EVENT, clearMessages)
+      window.removeEventListener('focus', clearNotice)
+    }
   }, [])
 
-  useEffect(() => {
-    refresh()
-    window.addEventListener(CREDENTIALS_CHANGED_EVENT, refresh)
-    window.addEventListener('focus', refresh)
-    return () => {
-      window.removeEventListener(CREDENTIALS_CHANGED_EVENT, refresh)
-      window.removeEventListener('focus', refresh)
-    }
-  }, [refresh])
-
-  useEffect(() => {
-    if (!status?.unlockedUntil) return
-    const timer = window.setTimeout(refresh, Math.max(1, status.unlockedUntil - Date.now() + 50))
-    return () => window.clearTimeout(timer)
-  }, [refresh, status?.unlockedUntil])
-
   // Leaving any form discards typed secrets from state.
-  const exitForm = (next: FormMode, noticeText = '') => {
+  const exitForm = (next: FormMode, noticeText = '', unlocked?: boolean) => {
     setFields(EMPTY_FIELDS)
     setRemoveProviders([])
     setClearSession(false)
     setPass1('')
     setPass2('')
     setError('')
-    setNotice(noticeText)
+    setNotice(noticeText ? { text: noticeText, unlocked } : null)
     setMode(next)
   }
 
@@ -180,13 +172,13 @@ const CloudCredentials = (): ReactElement => {
   const handleUnlock = async () => {
     if (busy || pass1 === '') return
     const ok = await act('unlock', { passphrase: pass1 })
-    if (ok) exitForm('status', 'Unlocked — you can now log in from the Terraform panel.')
+    if (ok) exitForm('status', 'Unlocked — you can now log in from the Terraform panel.', true)
   }
 
   const handleLock = async () => {
     if (busy) return
     const ok = await act('lock')
-    if (ok) exitForm('status', 'Locked — the in-memory copy was discarded.')
+    if (ok) exitForm('status', 'Locked — the in-memory copy was discarded.', false)
   }
 
   const handleChangePassphrase = async () => {
@@ -272,8 +264,11 @@ const CloudCredentials = (): ReactElement => {
           {configured.some(p => !status.sessions[p]) && status.unlocked && (
             <p className="tf-status">Unlocked only opens the local store. Use Login in the Terraform panel to authenticate before running cloud commands.</p>
           )}
-          {status.unlocked && status.details?.aws && !status.details.aws.hasSecretAccessKey && (
-            <p className="tf-status error">The AWS secret access key is missing. Edit the AWS credentials and save a valid key before logging in.</p>
+          {status.unlocked && status.details?.aws?.hasSecretAccessKey === false && (
+            <p className="tf-status error">No AWS secret access key is saved in the local store. Add one in Edit to use stored AWS credentials.</p>
+          )}
+          {status.unlocked && status.details?.aws && status.details.aws.hasSecretAccessKey === undefined && (
+            <p className="tf-status">AWS credential status could not be verified. Restart TerraCode if the server is out of date.</p>
           )}
           {!status.unlocked && (
             <div className="tf-creds-row">
@@ -434,7 +429,9 @@ const CloudCredentials = (): ReactElement => {
       )}
 
       {error !== '' && <p className="tf-status error">{error}</p>}
-      {notice !== '' && !showForm && mode === 'status' && <p className="tf-status ok">{notice}</p>}
+      {notice !== null && !showForm && mode === 'status' && (notice.unlocked === undefined || notice.unlocked === status?.unlocked) && (
+        <p className="tf-status ok">{notice.text}</p>
+      )}
     </div>
   )
 }

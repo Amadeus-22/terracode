@@ -1886,31 +1886,53 @@ function writeCredFile(fileObj) {
 // In-memory unlocked store (never persisted): single global payload + expiry.
 let credUnlockedPayload = null;
 let credUnlockExpiry = 0;
+let credUnlockTimer = null;
+let credLockGeneration = 0;
+
+// Sessions contain provider identities, not secrets. A pending login must not
+// be allowed to restore a session after a lock, logout, or credential change.
+const cloudSessions = new Map();
+const cloudLoginGenerations = new Map();
+
+function invalidateCloudLogin(provider) {
+  const generation = (cloudLoginGenerations.get(provider) ?? 0) + 1;
+  cloudLoginGenerations.set(provider, generation);
+  return generation;
+}
 
 function credUnlockEntry() {
   if (credUnlockedPayload === null) return null;
   if (Date.now() >= credUnlockExpiry) {
-    credUnlockedPayload = null; // lazy TTL expiry
-    credUnlockExpiry = 0;
+    clearCredUnlock();
     return null;
   }
   return credUnlockedPayload;
 }
 
+function scheduleCredExpiry() {
+  const delay = Math.max(1, Math.min(credUnlockExpiry - Date.now(), 2_147_483_647));
+  credUnlockTimer = setTimeout(() => {
+    if (Date.now() >= credUnlockExpiry) clearCredUnlock();
+    else scheduleCredExpiry();
+  }, delay);
+  credUnlockTimer.unref();
+}
+
 function setCredUnlock(payload) {
+  if (credUnlockTimer !== null) clearTimeout(credUnlockTimer);
   credUnlockedPayload = payload;
   credUnlockExpiry = Date.now() + CRED_UNLOCK_TTL_MS;
+  scheduleCredExpiry();
 }
 
 function clearCredUnlock() {
+  if (credUnlockTimer !== null) clearTimeout(credUnlockTimer);
+  credUnlockTimer = null;
   credUnlockedPayload = null;
   credUnlockExpiry = 0;
+  credLockGeneration += 1;
+  cloudSessions.clear();
 }
-
-// Active cloud login sessions (never persisted): provider -> session info.
-// A session exists only after a real, successful authentication against the
-// cloud service; it is what gates credential injection into terraform runs.
-const cloudSessions = new Map();
 
 // --- Cloud CLI helpers --------------------------------------------------------
 
@@ -2131,6 +2153,7 @@ function buildCloudEnv() {
 // returns credential values — only which providers are configured, whether the
 // store is unlocked, and which logins are currently active.
 app.get('/api/cloud/status', (req, res) => {
+  res.set('Cache-Control', 'no-store');
   const fileObj = readCredFile();
   const unlocked = credUnlockEntry() !== null;
   // Non-secret identifiers only, and only while unlocked (decryption required).
@@ -2231,7 +2254,10 @@ app.post('/api/cloud/credentials', (req, res) => {
     }
     if (action === 'update') {
       for (const provider of ['aws', 'azure', 'gcp']) {
-        if (JSON.stringify(old[provider]) !== JSON.stringify(next[provider])) cloudSessions.delete(provider);
+        if (JSON.stringify(old[provider]) !== JSON.stringify(next[provider])) {
+          invalidateCloudLogin(provider);
+          cloudSessions.delete(provider);
+        }
       }
     }
     // The caller just proved passphrase knowledge (or set a new one): leave the
@@ -2300,7 +2326,6 @@ app.post('/api/cloud/credentials', (req, res) => {
       return res.status(500).json({ error: 'Failed to delete credentials', details: err.message });
     }
     clearCredUnlock();
-    cloudSessions.clear(); // no logins can survive the store being gone
     return res.json(statusPayload());
   }
 
@@ -2338,17 +2363,25 @@ app.post('/api/cloud/login', async (req, res) => {
   const creds = payload[provider];
   if (!creds) return res.status(404).json({ error: `No ${provider} credentials are registered` });
 
+  const lockGeneration = credLockGeneration;
+  const loginGeneration = invalidateCloudLogin(provider);
   let outcome;
   try {
     outcome = provider === 'aws' ? await loginAws(creds) : provider === 'azure' ? await loginAzure(creds) : await loginGcp(creds);
   } catch (err) {
     return res.status(500).json({ error: `Login failed: ${err.message}` });
   }
+  // Check expiry first: it also invalidates sessions and pending logins.
+  const currentPayload = credUnlockEntry();
+  if (currentPayload === null || credLockGeneration !== lockGeneration ||
+      cloudLoginGenerations.get(provider) !== loginGeneration) {
+    return res.status(409).json({ error: 'Credential state changed while logging in — start login again' });
+  }
   if (outcome.error) return res.status(401).json({ error: outcome.error });
 
   const session = { loggedInAt: Date.now(), identity: outcome.identity, ...outcome };
   cloudSessions.set(provider, session);
-  setCredUnlock(payload); // a successful login keeps the store unlocked
+  setCredUnlock(currentPayload); // preserve unrelated credential updates
   res.json({ ok: true, provider, session });
 });
 
@@ -2360,6 +2393,7 @@ app.post('/api/cloud/logout', (req, res) => {
   if (!Object.hasOwn(CRED_PROVIDERS, provider)) {
     return res.status(400).json({ error: `provider must be one of ${Object.keys(CRED_PROVIDERS).join(', ')}` });
   }
+  invalidateCloudLogin(provider);
   cloudSessions.delete(provider);
   res.json({ ok: true, provider });
 });
@@ -3614,6 +3648,7 @@ app.post('/api/git/rebase-step', async (req, res) => {
 // store — which providers are configured and whether it is unlocked. Never
 // returns credential values; management reuses /api/cloud/credentials.
 app.get('/api/git/credentials', (req, res) => {
+  res.set('Cache-Control', 'no-store');
   const fileObj = readCredFile();
   const payload = credUnlockEntry();
   const all = payload !== null ? Object.keys(payload) : fileObj !== null && Array.isArray(fileObj.meta?.providers) ? fileObj.meta.providers : [];
