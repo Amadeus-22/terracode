@@ -1492,24 +1492,127 @@ describe('POST /api/tf/run (lifecycle)', () => {
     expect(fs.readFileSync(path.join(dir, '.apply-log'), 'utf-8').trim()).toBe('apply -input=false -no-color tf.plan')
   })
 
+  // A fresh project with main.tf and a saved plan from plan-file.
+  const plannedProject = async (name, files = {}) => {
+    const dir = tfDir(name)
+    fs.rmSync(dir, { recursive: true, force: true })
+    fs.mkdirSync(dir, { recursive: true })
+    for (const [file, content] of Object.entries({ 'main.tf': 'resource "s" "t" {}\n', ...files })) {
+      fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true })
+      fs.writeFileSync(path.join(dir, file), content)
+    }
+    const plan = await request(app).post('/api/tf/run').send({ command: 'plan-file', path: dir })
+    expect(plan.status).toBe(200)
+    return dir
+  }
+  const apply = (dir) => request(app).post('/api/tf/run').send({ command: 'apply', path: dir })
+
   it('refuses to apply a saved plan when a .tf file changed after it', async () => {
-    const dir = tfDir('plan')
-    const mainTf = path.join(dir, 'main.tf')
-    if (!fs.existsSync(mainTf)) fs.writeFileSync(mainTf, 'resource "s" "t" {}\n')
-    fs.rmSync(path.join(dir, '.apply-log'), { force: true })
-    await request(app).post('/api/tf/run').send({ command: 'plan-file', path: dir })
-    const later = new Date(Date.now() + 5000)
-    fs.utimesSync(path.join(dir, 'main.tf'), later, later)
-    const res = await request(app).post('/api/tf/run').send({ command: 'apply', path: dir })
+    const dir = await plannedProject('stale-edit')
+    fs.writeFileSync(path.join(dir, 'main.tf'), 'resource "s" "u" {}\n')
+    const res = await apply(dir)
     expect(res.status).toBe(409)
     expect(res.body.error).toContain('main.tf changed after tf.plan')
     expect(fs.existsSync(path.join(dir, '.apply-log'))).toBe(false)
 
     await request(app).post('/api/tf/run').send({ command: 'plan-file', path: dir })
-    const fresh = new Date(Date.now() - 5000)
-    fs.utimesSync(path.join(dir, 'main.tf'), fresh, fresh)
-    const again = await request(app).post('/api/tf/run').send({ command: 'apply', path: dir })
-    expect(again.status).toBe(200)
+    expect((await apply(dir)).status).toBe(200)
+  })
+
+  it('refuses a stale plan even when the edited file keeps its old timestamp', async () => {
+    const dir = await plannedProject('stale-mtime')
+    const mainTf = path.join(dir, 'main.tf')
+    const { atime, mtime } = fs.statSync(mainTf)
+    fs.writeFileSync(mainTf, 'resource "s" "u" {}\n')
+    fs.utimesSync(mainTf, atime, mtime) // like cp -p, touch -r or git checkout
+    const res = await apply(dir)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toContain('main.tf changed')
+  })
+
+  it('applies when only timestamps changed after the plan', async () => {
+    const dir = await plannedProject('stale-touch')
+    const later = new Date(Date.now() + 5000)
+    fs.utimesSync(path.join(dir, 'main.tf'), later, later)
+    expect((await apply(dir)).status).toBe(200)
+  })
+
+  it('refuses a stale plan when a configuration file was deleted', async () => {
+    const dir = await plannedProject('stale-delete', { 'extra.tf': 'variable "x" {}\n' })
+    fs.rmSync(path.join(dir, 'extra.tf'))
+    const res = await apply(dir)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toContain('extra.tf was removed after tf.plan')
+  })
+
+  it.each([
+    ['main.tf.json', '{"resource":{}}', '{"resource":{"s":{}}}'],
+    ['terraform.tfvars.json', '{"x":1}', '{"x":2}'],
+    ['prod.auto.tfvars', 'x = 1\n', 'x = 2\n'],
+  ])('refuses a stale plan when %s changed', async (file, before, after) => {
+    const dir = await plannedProject(`stale-${file}`, { [file]: before })
+    fs.writeFileSync(path.join(dir, file), after)
+    const res = await apply(dir)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toContain(`${file} changed`)
+  })
+
+  it('refuses a stale plan when a .tf.json file was added', async () => {
+    const dir = await plannedProject('stale-add')
+    fs.writeFileSync(path.join(dir, 'override.tf.json'), '{}')
+    const res = await apply(dir)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toContain('override.tf.json was added')
+  })
+
+  it('checks configuration files larger than the editor size limit', async () => {
+    const big = `# ${'x'.repeat(1024 * 1024 + 10)}\n`
+    const dir = await plannedProject('stale-big', { 'big.tf': big })
+    fs.writeFileSync(path.join(dir, 'big.tf'), `${big}# edited\n`)
+    const res = await apply(dir)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toContain('big.tf changed')
+  })
+
+  it('fails closed when there are too many configuration files to check', async () => {
+    const dir = await plannedProject('stale-many')
+    for (let i = 0; i < 1000; i++) fs.writeFileSync(path.join(dir, `f${i}.tf`), '')
+    await request(app).post('/api/tf/run').send({ command: 'plan-file', path: dir })
+    const res = await apply(dir)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toContain('Run the plan again')
+    expect(fs.existsSync(path.join(dir, '.apply-log'))).toBe(false)
+  })
+
+  it('fails closed when tf.plan was not created through plan-file', async () => {
+    const dir = await plannedProject('stale-foreign')
+    fs.writeFileSync(path.join(dir, 'tf.plan'), 'plan made elsewhere')
+    const res = await apply(dir)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toContain('tf.plan changed')
+  })
+
+  it('ignores a nested directory that is its own terraform root', async () => {
+    const dir = await plannedProject('stale-nested', { 'other/main.tf': 'resource "a" "b" {}\n' })
+    fs.writeFileSync(path.join(dir, 'other', 'main.tf'), 'resource "a" "c" {}\n')
+    fs.writeFileSync(path.join(dir, 'other', 'new.tf'), '')
+    expect((await apply(dir)).status).toBe(200)
+  })
+
+  it('refuses a stale plan when a local module source changed', async () => {
+    const modules = JSON.stringify({ Modules: [
+      { Key: '', Source: '', Dir: '.' },
+      { Key: 'net', Source: './modules/net', Dir: 'modules/net' },
+      { Key: 'remote', Source: 'registry.terraform.io/x/y/z', Dir: '.terraform/modules/remote' },
+    ] })
+    const dir = await plannedProject('stale-module', {
+      'modules/net/main.tf': 'variable "cidr" {}\n',
+      '.terraform/modules/modules.json': modules,
+    })
+    fs.writeFileSync(path.join(dir, 'modules', 'net', 'main.tf'), 'variable "cidr" { default = "x" }\n')
+    const res = await apply(dir)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toContain(path.join('modules', 'net', 'main.tf'))
   })
 
   it('apply fails cleanly when no plan file exists', async () => {

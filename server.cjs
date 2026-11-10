@@ -1137,40 +1137,90 @@ function buildTfArgs(command, opts) {
   return args;
 }
 
-// Build the JSON payload for a terraform command. Returns { statusCode, body }.
-// onChunk (optional) receives raw stdout/stderr chunks while the command runs.
 // A saved plan carries the configuration it was made from, so applying it after
-// a .tf/.tfvars edit silently ignores that edit. Returns the first such file
-// changed after tf.plan was written, or null (also when there is no plan).
-function fileChangedSincePlan(dir) {
-  let planMtime;
-  try {
-    planMtime = fs.statSync(path.join(dir, TF_PLAN_FILE)).mtimeMs;
-  } catch {
-    return null;
+// a configuration edit silently ignores that edit. plan-file records a content
+// fingerprint of what terraform reads (see tfConfigFiles) and apply compares it.
+// Hashes, not mtimes: cp -p, touch -r or a git checkout can keep old timestamps.
+const TF_PLAN_MAX_FILES = 1000; // more config files than this fails closed
+const TF_CONFIG_RE = /\.(tf|tf\.json|tfvars|tfvars\.json)$/;
+const TF_MODULE_CONFIG_RE = /\.(tf|tf\.json)$/;
+const tfPlanFingerprints = new Map(); // dir -> Map(relative name -> sha256)
+
+// Top-level config files of one directory (terraform does not recurse).
+function listTfConfigDir(dir, re, out) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isFile() && re.test(entry.name)) out.push(path.join(dir, entry.name));
   }
-  const files = new Map();
-  collectTfFiles(dir, 0, files);
-  for (const file of files.keys()) {
-    try {
-      if (fs.statSync(file).mtimeMs > planMtime) return file;
-    } catch {
-      // removed meanwhile; nothing to compare
-    }
+}
+
+// The files a plan in dir depends on: the root module's top-level .tf/.tf.json/
+// .tfvars/.tfvars.json files, the top-level .tf/.tf.json files of local modules
+// recorded by terraform init, and the saved plan itself. Nested directories that
+// are not module sources (e.g. another root) are ignored, as terraform does.
+function tfConfigFiles(dir) {
+  const files = [];
+  listTfConfigDir(dir, TF_CONFIG_RE, files);
+  let modules = [];
+  try {
+    modules = JSON.parse(fs.readFileSync(path.join(dir, '.terraform', 'modules', 'modules.json'), 'utf-8')).Modules || [];
+  } catch {
+    // not initialized or no modules
+  }
+  const seen = new Set([dir]);
+  for (const mod of modules) {
+    if (typeof mod?.Source !== 'string' || typeof mod.Dir !== 'string') continue;
+    if (!mod.Source.startsWith('./') && !mod.Source.startsWith('../')) continue;
+    const modDir = path.resolve(dir, mod.Dir);
+    if (seen.has(modDir)) continue;
+    seen.add(modDir);
+    listTfConfigDir(modDir, TF_MODULE_CONFIG_RE, files);
+  }
+  files.push(path.join(dir, TF_PLAN_FILE));
+  return files;
+}
+
+// Map(relative name -> sha256) of tfConfigFiles(dir). Throws when a file cannot
+// be read or there are too many to check, so callers fail closed.
+function tfPlanFingerprint(dir) {
+  const files = tfConfigFiles(dir);
+  if (files.length > TF_PLAN_MAX_FILES) throw new Error('too many configuration files');
+  const out = new Map();
+  for (const file of files) {
+    out.set(path.relative(dir, file), crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'));
+  }
+  return out;
+}
+
+// Why the saved plan in dir must not be applied, or null when it still matches
+// the configuration (also when there is no plan: terraform reports that).
+function stalePlanReason(dir) {
+  if (!fs.existsSync(path.join(dir, TF_PLAN_FILE))) return null;
+  const recorded = tfPlanFingerprints.get(dir);
+  if (!recorded) return `${TF_PLAN_FILE} was not created by this session.`;
+  let current;
+  try {
+    current = tfPlanFingerprint(dir);
+  } catch {
+    return 'The configuration could not be fully checked against the saved plan.';
+  }
+  for (const [name, hash] of recorded) {
+    if (current.get(name) !== hash) return `${name} ${current.has(name) ? 'changed' : 'was removed'} after ${TF_PLAN_FILE} was created.`;
+  }
+  for (const name of current.keys()) {
+    if (!recorded.has(name)) return `${name} was added after ${TF_PLAN_FILE} was created.`;
   }
   return null;
 }
 
+// Build the JSON payload for a terraform command. Returns { statusCode, body }.
+// onChunk (optional) receives raw stdout/stderr chunks while the command runs.
 async function runTerraformCommand(command, dir, opts = {}, onChunk) {
   if (command === 'apply') {
-    const changed = fileChangedSincePlan(dir);
-    if (changed) {
-      return {
-        statusCode: 409,
-        body: { error: `${path.relative(dir, changed)} changed after ${TF_PLAN_FILE} was created. Run the plan again before applying.` },
-      };
-    }
+    const stale = stalePlanReason(dir);
+    if (stale) return { statusCode: 409, body: { error: `${stale} Run the plan again before applying.` } };
   }
+  const savesPlan = command === 'plan-file' || command === 'plan-file-destroy';
+  if (savesPlan) tfPlanFingerprints.delete(dir);
 
   // fmt needs the pre-format content to build diffs; capture it first.
   const before = new Map();
@@ -1202,6 +1252,13 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
     result = await runTerraform(dir, args, onChunk, stdin, Object.keys(credEnv).length > 0 ? credEnv : undefined);
     if (previewDir && !result.error && !result.timedOut && result.exitCode === 0) {
       previewId = rememberTfPreview(dir, path.join(previewDir, 'plan'));
+    }
+    if (savesPlan && !result.error && !result.timedOut && result.exitCode === 0) {
+      try {
+        tfPlanFingerprints.set(dir, tfPlanFingerprint(dir));
+      } catch {
+        // left unrecorded: apply then asks for a new plan
+      }
     }
   } finally {
     if (previewDir) fs.rmSync(previewDir, { recursive: true, force: true });
