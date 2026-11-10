@@ -750,7 +750,7 @@ const TF_COMMANDS = {
   output: ['output', '-no-color'],
   'state-list': ['state', 'list', '-no-color'],
   // Guarded apply flow, see TF_PLAN_FILE above.
-  'plan-file': ['plan', '-input=false', '-no-color', `-out=${TF_PLAN_FILE}`],
+  'plan-file': ['plan', '-input=false', '-no-color'],
   apply: ['apply', '-input=false', '-no-color', TF_PLAN_FILE],
   version: ['version', '-no-color'],
   'init-upgrade': ['init', '-input=false', '-no-color', '-upgrade'],
@@ -758,7 +758,7 @@ const TF_COMMANDS = {
   // Inspect the saved execution plan (terraform show tfplan).
   'show-plan': ['show', '-no-color', TF_PLAN_FILE],
   // Guarded destroy flow: save a destroy plan, then `apply` applies that file.
-  'plan-file-destroy': ['plan', '-input=false', '-no-color', '-destroy', `-out=${TF_PLAN_FILE}`],
+  'plan-file-destroy': ['plan', '-input=false', '-no-color', '-destroy'],
 };
 
 // Commands with client-supplied arguments (each argument validated separately).
@@ -1137,9 +1137,184 @@ function buildTfArgs(command, opts) {
   return args;
 }
 
+// A saved plan carries the configuration it was made from, so applying it after
+// a configuration edit silently ignores that edit. plan-file records a content
+// fingerprint of what terraform reads (see tfConfigFiles) and apply compares it.
+// Hashes, not mtimes: cp -p, touch -r or a git checkout can keep old timestamps.
+const TF_PLAN_MAX_FILES = 1000; // more config files than this fails closed
+const TF_CONFIG_RE = /\.(tf|tf\.json|tfvars|tfvars\.json)$/;
+const TF_MODULE_CONFIG_RE = /\.(tf|tf\.json)$/;
+const tfPlanFingerprints = new Map(); // dir -> Map(relative name -> sha256)
+
+// Top-level config files of one directory (terraform does not recurse).
+function listTfConfigDir(dir, re, out, directories, symlinkTargets) {
+  directories.push({ dir, re });
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!re.test(entry.name)) continue;
+    const file = path.join(dir, entry.name);
+    if (entry.isFile()) {
+      out.push(file);
+    } else if (entry.isSymbolicLink()) {
+      const target = fs.realpathSync(file);
+      if (!withinAnyRootReal(target) || !fs.statSync(target).isFile()) {
+        throw new Error('Terraform configuration symlink cannot be checked safely');
+      }
+      symlinkTargets.push(target);
+      out.push(file);
+    }
+  }
+}
+
+// The files a plan in dir depends on: the root module's top-level .tf/.tf.json/
+// .tfvars/.tfvars.json files, the top-level .tf/.tf.json files of local modules
+// recorded by terraform init, and the saved plan itself. Nested directories that
+// are not module sources (e.g. another root) are ignored, as terraform does.
+function tfConfigFiles(dir) {
+  const files = [];
+  const directories = [];
+  const symlinkTargets = [];
+  listTfConfigDir(dir, TF_CONFIG_RE, files, directories, symlinkTargets);
+  const dataDir = process.env.TF_DATA_DIR ? path.resolve(dir, process.env.TF_DATA_DIR) : path.join(dir, '.terraform');
+  const manifestPath = path.join(dataDir, 'modules', 'modules.json');
+  let modules = [];
+  let manifestStat;
+  try {
+    manifestStat = fs.lstatSync(manifestPath);
+  } catch (err) {
+    // Terraform does not create a module manifest for projects without modules.
+    if (err.code !== 'ENOENT') throw err;
+  }
+  if (manifestStat) {
+    if (!manifestStat.isFile()) throw new Error('Invalid Terraform module manifest');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+    if (!Array.isArray(manifest?.Modules)) throw new Error('Invalid Terraform module manifest');
+    modules = manifest.Modules;
+    files.push(manifestPath);
+  }
+  const seen = new Set([dir]);
+  for (const mod of modules) {
+    if (typeof mod?.Key !== 'string' || typeof mod.Dir !== 'string' || !mod.Dir) {
+      throw new Error('Invalid Terraform module manifest');
+    }
+    if (mod.Key === '') continue;
+    if (typeof mod.Source !== 'string' || !mod.Source) throw new Error('Invalid Terraform module manifest');
+    if (!mod.Source.startsWith('./') && !mod.Source.startsWith('../')) continue;
+    const modDir = path.resolve(dir, mod.Dir);
+    if (seen.has(modDir)) continue;
+    seen.add(modDir);
+    listTfConfigDir(modDir, TF_MODULE_CONFIG_RE, files, directories, symlinkTargets);
+  }
+  return { files, directories, symlinkTargets, manifestPath };
+}
+
+function hashTfFile(file) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error('Terraform input is not a regular file');
+    const hash = crypto.createHash('sha256');
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let bytes;
+    while ((bytes = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+      hash.update(buffer.subarray(0, bytes));
+    }
+    return hash.digest('hex');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Map(relative name -> fingerprint). Metadata is used only while a plan runs,
+// so a later timestamp-only change does not block an otherwise valid plan.
+function tfPlanFingerprint(dir, { includePlan = true, metadata = false, planFile = path.join(dir, TF_PLAN_FILE) } = {}) {
+  const { files } = tfConfigFiles(dir);
+  if (includePlan) files.push(planFile);
+  if (files.length > TF_PLAN_MAX_FILES) throw new Error('too many configuration files');
+  const out = new Map();
+  for (const file of files) {
+    let fingerprint = hashTfFile(file);
+    if (metadata) {
+      const link = fs.lstatSync(file, { bigint: true });
+      const target = fs.statSync(file, { bigint: true });
+      fingerprint += `:${link.dev}:${link.ino}:${link.ctimeNs}:${target.dev}:${target.ino}:${target.ctimeNs}`;
+    }
+    out.set(includePlan && file === planFile ? TF_PLAN_FILE : path.relative(dir, file), fingerprint);
+  }
+  return out;
+}
+
+function sameTfFingerprint(a, b) {
+  return a.size === b.size && [...a].every(([name, value]) => b.get(name) === value);
+}
+
+// Observe configuration changes for the entire plan, including edits that are
+// later reverted. A missing filename or watcher error is treated as a change.
+function watchTfPlanConfig(dir) {
+  const { directories, symlinkTargets, manifestPath } = tfConfigFiles(dir);
+  const watchers = [];
+  let changed = false;
+  const watch = (parent, matches) => {
+    const watcher = fs.watch(parent, { persistent: false }, (_event, name) => {
+      if (!name || matches(String(name))) changed = true;
+    });
+    watcher.on('error', () => { changed = true; });
+    watchers.push(watcher);
+  };
+  const watchFile = file => {
+    let parent = path.dirname(file);
+    let name = path.basename(file);
+    while (!fs.existsSync(parent)) {
+      name = path.basename(parent);
+      const next = path.dirname(parent);
+      if (next === parent) throw new Error('Cannot watch Terraform configuration');
+      parent = next;
+    }
+    watch(parent, entry => entry === name);
+  };
+  try {
+    for (const item of directories) watch(item.dir, name => item.re.test(name));
+    for (const target of symlinkTargets) watchFile(target);
+    watchFile(manifestPath);
+  } catch (err) {
+    for (const watcher of watchers) watcher.close();
+    throw err;
+  }
+  return { hasChanged: () => changed, close: () => watchers.forEach(watcher => watcher.close()) };
+}
+
+// Why the saved plan in dir must not be applied, or null when it still matches
+// the configuration (also when there is no plan: terraform reports that).
+function stalePlanReason(dir) {
+  if (!fs.existsSync(path.join(dir, TF_PLAN_FILE))) return null;
+  const recorded = tfPlanFingerprints.get(dir);
+  if (!recorded) return `${TF_PLAN_FILE} was not created by this session.`;
+  let current;
+  try {
+    current = tfPlanFingerprint(dir);
+  } catch {
+    return 'The configuration could not be fully checked against the saved plan.';
+  }
+  for (const [name, hash] of recorded) {
+    if (current.get(name) !== hash) return `${name} ${current.has(name) ? 'changed' : 'was removed'} after ${TF_PLAN_FILE} was created.`;
+  }
+  for (const name of current.keys()) {
+    if (!recorded.has(name)) return `${name} was added after ${TF_PLAN_FILE} was created.`;
+  }
+  return null;
+}
+
 // Build the JSON payload for a terraform command. Returns { statusCode, body }.
 // onChunk (optional) receives raw stdout/stderr chunks while the command runs.
 async function runTerraformCommand(command, dir, opts = {}, onChunk) {
+  if (command === 'apply') {
+    const stale = stalePlanReason(dir);
+    if (stale) return { statusCode: 409, body: { error: `${stale} Run the plan again before applying.` } };
+  }
+  const savesPlan = command === 'plan-file' || command === 'plan-file-destroy';
+  let planBefore;
+  let planWatch;
+  let savedPlanDir;
+  if (savesPlan) tfPlanFingerprints.delete(dir);
+
   // fmt needs the pre-format content to build diffs; capture it first.
   const before = new Map();
   if (command === 'fmt') collectTfFiles(dir, 0, before);
@@ -1167,11 +1342,47 @@ async function runTerraformCommand(command, dir, opts = {}, onChunk) {
   let result;
   let previewId = null;
   try {
+    if (savesPlan) {
+      try {
+        planBefore = tfPlanFingerprint(dir, { includePlan: false, metadata: true });
+        planWatch = watchTfPlanConfig(dir);
+        const watched = tfPlanFingerprint(dir, { includePlan: false, metadata: true });
+        if (!sameTfFingerprint(planBefore, watched)) throw new Error('Configuration changed before planning');
+        savedPlanDir = fs.mkdtempSync(path.join(dir, '.terracode-plan-'));
+        args.push(`-out=${path.join(savedPlanDir, TF_PLAN_FILE)}`);
+      } catch {
+        return { statusCode: 409, body: { error: 'The configuration cannot be checked safely. Check its files and modules before planning.' } };
+      }
+    }
     result = await runTerraform(dir, args, onChunk, stdin, Object.keys(credEnv).length > 0 ? credEnv : undefined);
     if (previewDir && !result.error && !result.timedOut && result.exitCode === 0) {
       previewId = rememberTfPreview(dir, path.join(previewDir, 'plan'));
     }
+    if (savesPlan && !result.error && !result.timedOut && result.exitCode === 0) {
+      try {
+        // Let queued filesystem events run before checking the final snapshot.
+        await new Promise(resolve => setImmediate(resolve));
+        const afterPlan = tfPlanFingerprint(dir, { includePlan: false, metadata: true });
+        const planFile = path.join(savedPlanDir, TF_PLAN_FILE);
+        const recorded = tfPlanFingerprint(dir, { planFile });
+        const verified = tfPlanFingerprint(dir, { includePlan: false, metadata: true });
+        await new Promise(resolve => setImmediate(resolve));
+        if (planWatch.hasChanged() || !sameTfFingerprint(planBefore, afterPlan) || !sameTfFingerprint(afterPlan, verified)) {
+          return { statusCode: 409, body: { error: 'The configuration changed while Terraform was planning. Run the plan again before applying.' } };
+        }
+        const publishedPlan = path.join(dir, TF_PLAN_FILE);
+        fs.renameSync(planFile, publishedPlan);
+        if (hashTfFile(publishedPlan) !== recorded.get(TF_PLAN_FILE)) {
+          return { statusCode: 409, body: { error: 'The saved plan changed during publication. Run the plan again before applying.' } };
+        }
+        tfPlanFingerprints.set(dir, recorded);
+      } catch {
+        return { statusCode: 409, body: { error: 'The configuration could not be checked against the saved plan. Check its files and modules before retrying.' } };
+      }
+    }
   } finally {
+    planWatch?.close();
+    if (savedPlanDir) fs.rmSync(savedPlanDir, { recursive: true, force: true });
     if (previewDir) fs.rmSync(previewDir, { recursive: true, force: true });
   }
   if (result.error === 'enoent') {
