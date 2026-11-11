@@ -81,10 +81,10 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
   // Selective commit: paths the user unchecked (empty set = everything selected).
   const [unselected, setUnselected] = useState<Set<string>>(new Set())
 
-  // A fresh status fetch means a new selection baseline: select all again.
+  // Keep exclusions across status refreshes, but reset them for another folder.
   useEffect(() => {
     setUnselected(new Set()) // eslint-disable-line react/set-state-in-effect
-  }, [dirPath, refreshKey])
+  }, [dirPath])
 
   // New-branch form.
   const [newBranchOpen, setNewBranchOpen] = useState(false)
@@ -155,12 +155,13 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
   }
 
   // Explicit pathspecs for a selective commit; renames contribute both paths.
-  const selectedSpecs = entries
-    .filter(e => !unselected.has(fileKey(e)))
+  const selectedEntries = entries.filter(e => !unselected.has(fileKey(e)))
+  const selectedSpecs = selectedEntries
     .flatMap(e => (e.origPath ? [e.origPath, e.path] : [e.path]))
-  const selectedCount = entries.length - unselected.size
+  const selectedCount = selectedEntries.length
+  const unselectedCount = entries.length - selectedCount
   // The all-inclusive path sends no file list, so the cap only bites on subsets.
-  const overCap = unselected.size > 0 && selectedSpecs.length > SELECTIVE_COMMIT_CAP
+  const overCap = unselectedCount > 0 && selectedSpecs.length > SELECTIVE_COMMIT_CAP
 
   const toggleFile = (key: string) => {
     setUnselected(prev => {
@@ -173,15 +174,15 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
 
   const handleCommit = async () => {
     const msg = message.trim()
-    if (!msg || committing || overCap) return
+    if (!msg || committing || overCap || selectedCount === 0) return
     setCommitting(true)
     setOpStatus(null)
     try {
       let files: string[] | undefined
-      if (unselected.size > 0) {
+      if (unselectedCount > 0) {
         const ok = window.confirm(
           `Commit only ${selectedCount} of ${entries.length} file(s)?\n` +
-            `${unselected.size} change(s) will not be included in this commit.`,
+            `${unselectedCount} change(s) will not be included in this commit.`,
         )
         if (!ok) return
         files = selectedSpecs
@@ -189,6 +190,7 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
       const result = await gitCommit(dirPath, msg, files)
       if (result.committed) {
         setMessage('')
+        setUnselected(new Set())
         setOpStatus({ kind: 'ok', text: `Committed ${result.hash ?? ''}`.trim() })
         onRefresh()
       } else {
@@ -205,6 +207,7 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
     if (!ref || ref === branches?.current) return
     await runOp('switch', async () => {
       await checkoutBranch(dirPath, ref)
+      setUnselected(new Set())
       setRebaseInProgress(false)
       setOpStatus({ kind: 'ok', text: `Switched to ${ref}` })
       onRefresh()
@@ -216,6 +219,7 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
     if (!name || busy !== null) return
     await runOp('create branch', async () => {
       await createBranch(dirPath, name, { switch: true })
+      setUnselected(new Set())
       setNewBranchOpen(false)
       setNewBranchName('')
       setRebaseInProgress(false)
@@ -598,7 +602,7 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
           <div className="git-changed-files">
             <div className="git-changed-header">
               <span>{selectedCount} of {entries.length} selected</span>
-              {unselected.size > 0 && (
+              {unselectedCount > 0 && (
                 <button type="button" className="git-mini-btn" onClick={() => setUnselected(new Set())}>
                   Select all
                 </button>
@@ -643,11 +647,11 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
           <button
             className="git-commit-btn"
             onClick={() => void handleCommit()}
-            disabled={!message.trim() || committing || overCap}
+            disabled={!message.trim() || committing || overCap || selectedCount === 0}
           >
             {committing
               ? 'Committing…'
-              : unselected.size > 0
+              : unselectedCount > 0
                 ? `Commit ${selectedCount} of ${entries.length}`
                 : `Commit ${entries.length} change${entries.length === 1 ? '' : 's'}`}
           </button>

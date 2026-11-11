@@ -317,6 +317,15 @@ describe('API Layer', () => {
       )
     })
 
+    it('preserves an explicitly empty file list', async () => {
+      mockFetch({ committed: false })
+      await gitCommit('/root', 'test message', [])
+      expect(globalThis.fetch).toHaveBeenCalledWith(
+        `${API_BASE}/api/git/commit`,
+        expect.objectContaining({ body: JSON.stringify({ path: '/root', message: 'test message', files: [] }) })
+      )
+    })
+
     it('getGitBranches should fetch branches', async () => {
       mockFetch({ isRepo: true, current: 'main', branches: ['main', 'dev'] })
       const result = await getGitBranches('/root')
