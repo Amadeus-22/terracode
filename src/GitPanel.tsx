@@ -27,6 +27,25 @@ const MAX_RENDERED_FILES = 300
 
 // Stable identity of a status entry (renames carry both paths).
 const fileKey = (e: GitStatusEntry): string => (e.origPath ? `${e.origPath}→${e.path}` : e.path)
+const entryPaths = (e: GitStatusEntry): string[] => (e.origPath ? [e.origPath, e.path] : [e.path])
+
+// Git may replace an untracked directory with individual entries (or collapse
+// those entries again). Remember the most specific choice for each path.
+function isEntryExcluded(entry: GitStatusEntry, choices: Map<string, boolean>): boolean {
+  return entryPaths(entry).some(path => {
+    let selected = true
+    let matchedLength = -1
+    for (const [choice, include] of choices) {
+      if ((choice === path || (choice.endsWith('/') && path.startsWith(choice))) && choice.length > matchedLength) {
+        selected = include
+        matchedLength = choice.length
+      }
+    }
+    if (!selected) return true
+    // A collapsed directory must not commit a child the user excluded.
+    return path.endsWith('/') && [...choices].some(([choice, include]) => !include && choice.startsWith(path))
+  })
+}
 
 type GitPanelProps = {
   dirPath: string
@@ -78,12 +97,12 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
   const [message, setMessage] = useState('')
   const [committing, setCommitting] = useState(false)
 
-  // Selective commit: paths the user unchecked (empty set = everything selected).
-  const [unselected, setUnselected] = useState<Set<string>>(new Set())
+  // Explicit path choices; an empty map means everything is selected.
+  const [choices, setChoices] = useState<Map<string, boolean>>(new Map())
 
   // Keep exclusions across status refreshes, but reset them for another folder.
   useEffect(() => {
-    setUnselected(new Set()) // eslint-disable-line react/set-state-in-effect
+    setChoices(new Map()) // eslint-disable-line react/set-state-in-effect
   }, [dirPath])
 
   // New-branch form.
@@ -155,20 +174,29 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
   }
 
   // Explicit pathspecs for a selective commit; renames contribute both paths.
-  const selectedEntries = entries.filter(e => !unselected.has(fileKey(e)))
+  const selectedEntries = entries.filter(e => !isEntryExcluded(e, choices))
   const selectedSpecs = selectedEntries
     .flatMap(e => (e.origPath ? [e.origPath, e.path] : [e.path]))
   const selectedCount = selectedEntries.length
   const unselectedCount = entries.length - selectedCount
   // The all-inclusive path sends no file list, so the cap only bites on subsets.
-  const overCap = unselected.size > 0 && selectedSpecs.length > SELECTIVE_COMMIT_CAP
+  const hasExclusions = [...choices.values()].some(include => !include)
+  const overCap = hasExclusions && selectedSpecs.length > SELECTIVE_COMMIT_CAP
 
-  const toggleFile = (key: string) => {
-    setUnselected(prev => {
-      const next = new Set(prev)
-      if (next.has(key)) next.delete(key)
-      else next.add(key)
-      return next
+  const toggleFile = (entry: GitStatusEntry) => {
+    setChoices(prev => {
+      const next = new Map(prev)
+      const include = isEntryExcluded(entry, prev)
+      for (const path of entryPaths(entry)) {
+        if (path.endsWith('/')) {
+          for (const choice of next.keys()) {
+            if (choice.startsWith(path)) next.delete(choice)
+          }
+        }
+        next.set(path, include)
+      }
+      // With no exclusions there is no need for an explicit commit file list.
+      return [...next.values()].some(value => !value) ? next : new Map()
     })
   }
 
@@ -179,7 +207,7 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
     setOpStatus(null)
     try {
       let files: string[] | undefined
-      if (unselected.size > 0) {
+      if (hasExclusions) {
         if (unselectedCount > 0) {
           const ok = window.confirm(
             `Commit only ${selectedCount} of ${entries.length} file(s)?\n` +
@@ -208,7 +236,7 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
     if (!ref || ref === branches?.current) return
     await runOp('switch', async () => {
       await checkoutBranch(dirPath, ref)
-      setUnselected(new Set())
+      setChoices(new Map())
       setRebaseInProgress(false)
       setOpStatus({ kind: 'ok', text: `Switched to ${ref}` })
       onRefresh()
@@ -220,7 +248,7 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
     if (!name || busy !== null) return
     await runOp('create branch', async () => {
       await createBranch(dirPath, name, { switch: true })
-      setUnselected(new Set())
+      setChoices(new Map())
       setNewBranchOpen(false)
       setNewBranchName('')
       setRebaseInProgress(false)
@@ -603,8 +631,8 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
           <div className="git-changed-files">
             <div className="git-changed-header">
               <span>{selectedCount} of {entries.length} selected</span>
-              {unselected.size > 0 && (
-                <button type="button" className="git-mini-btn" onClick={() => setUnselected(new Set())}>
+              {hasExclusions && (
+                <button type="button" className="git-mini-btn" onClick={() => setChoices(new Map())}>
                   Select all
                 </button>
               )}
@@ -615,7 +643,7 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
                 const key = fileKey(e)
                 return (
                   <label key={key} className="git-file-row">
-                    <input type="checkbox" checked={!unselected.has(key)} onChange={() => toggleFile(key)} />
+                    <input type="checkbox" checked={!isEntryExcluded(e, choices)} onChange={() => toggleFile(e)} />
                     {badge && <span className={`git-badge ${badge.cls}`}>{badge.letter}</span>}
                     <span className="git-file-path" title={e.origPath ? `${e.origPath} → ${e.path}` : e.path}>
                       {e.origPath ? `${e.origPath} → ${e.path}` : e.path}
