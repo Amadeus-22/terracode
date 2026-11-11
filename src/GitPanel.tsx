@@ -161,7 +161,7 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
   const selectedCount = selectedEntries.length
   const unselectedCount = entries.length - selectedCount
   // The all-inclusive path sends no file list, so the cap only bites on subsets.
-  const overCap = unselectedCount > 0 && selectedSpecs.length > SELECTIVE_COMMIT_CAP
+  const overCap = unselected.size > 0 && selectedSpecs.length > SELECTIVE_COMMIT_CAP
 
   const toggleFile = (key: string) => {
     setUnselected(prev => {
@@ -179,18 +179,19 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
     setOpStatus(null)
     try {
       let files: string[] | undefined
-      if (unselectedCount > 0) {
-        const ok = window.confirm(
-          `Commit only ${selectedCount} of ${entries.length} file(s)?\n` +
-            `${unselectedCount} change(s) will not be included in this commit.`,
-        )
-        if (!ok) return
+      if (unselected.size > 0) {
+        if (unselectedCount > 0) {
+          const ok = window.confirm(
+            `Commit only ${selectedCount} of ${entries.length} file(s)?\n` +
+              `${unselectedCount} change(s) will not be included in this commit.`,
+          )
+          if (!ok) return
+        }
         files = selectedSpecs
       }
       const result = await gitCommit(dirPath, msg, files)
       if (result.committed) {
         setMessage('')
-        setUnselected(new Set())
         setOpStatus({ kind: 'ok', text: `Committed ${result.hash ?? ''}`.trim() })
         onRefresh()
       } else {
@@ -602,7 +603,7 @@ const GitPanel = ({ dirPath, isRepo, entries, refreshKey, onRefresh, onOpenCommi
           <div className="git-changed-files">
             <div className="git-changed-header">
               <span>{selectedCount} of {entries.length} selected</span>
-              {unselectedCount > 0 && (
+              {unselected.size > 0 && (
                 <button type="button" className="git-mini-btn" onClick={() => setUnselected(new Set())}>
                   Select all
                 </button>

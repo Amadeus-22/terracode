@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import GitPanel from './GitPanel'
 import { getGitBranches, getGitLog, getGitRemotes, gitCommit, type GitStatusEntry } from './api'
 
@@ -40,6 +40,21 @@ describe('Git commit selection', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     fireEvent.click(screen.getByRole('button', { name: 'Commit 2 of 3' }))
     await waitFor(() => expect(gitCommit).toHaveBeenCalledWith('/project', 'test', ['.terraform-version', 'new.tf']))
+    await screen.findByText('Committed abc1234')
+    await act(async () => rerender(<GitPanel {...props} entries={[entries[2]]} refreshKey={3} />))
+    expect(screen.getByRole('checkbox', { name: /tf\.plan/ })).not.toBeChecked()
+  })
+
+  it('does not fall back to committing everything if an excluded file disappears from status', async () => {
+    const entries = [untracked('module.tf'), untracked('tf.plan')]
+    const props = { dirPath: '/project', isRepo: true, onRefresh: vi.fn() }
+    const { rerender } = render(<GitPanel {...props} entries={entries} refreshKey={0} />)
+    await screen.findByRole('option', { name: 'main (current)' })
+    fireEvent.click(screen.getByRole('checkbox', { name: /tf\.plan/ }))
+    rerender(<GitPanel {...props} entries={[entries[0]]} refreshKey={1} />)
+    fireEvent.change(screen.getByLabelText('Commit message'), { target: { value: 'test' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Commit 1 change' }))
+    await waitFor(() => expect(gitCommit).toHaveBeenCalledWith('/project', 'test', ['module.tf']))
   })
 
   it('prevents a commit when no files are selected', async () => {
