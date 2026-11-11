@@ -3034,7 +3034,7 @@ describe('git operations', () => {
       expect(res.status).toBe(200)
       expect(res.body.committed).toBe(true)
       const addLog = fs.readFileSync(path.join(filesRepo, '.git', 'add-log'), 'utf-8')
-      expect(addLog.trim()).toBe('add -- keep.txt')
+      expect(addLog.trim()).toBe('add -- :(literal)keep.txt')
     })
 
     it('rejects an empty message with 400', async () => {
@@ -4087,5 +4087,159 @@ describe('git credentials (/api/git/credentials*)', () => {
     expect(res.status).toBe(200)
     const status = await request(app).get('/api/git/credentials')
     expect(status.body.exists).toBe(false)
+  })
+})
+
+describe('selective commits with real Git', () => {
+  let savedPath
+  let savedGlobalConfig
+  let savedNoSystem
+  const git = (dir, args) => execFileSync('git', args, { cwd: dir, encoding: 'utf-8' }).trim()
+  const makeRepo = () => {
+    const dir = fs.mkdtempSync(path.join(root, 'selective-git-'))
+    git(dir, ['init', '-q'])
+    git(dir, ['config', 'user.name', 'Test User'])
+    git(dir, ['config', 'user.email', 'test@example.invalid'])
+    return dir
+  }
+
+  beforeAll(() => {
+    savedPath = process.env.PATH
+    savedGlobalConfig = process.env.GIT_CONFIG_GLOBAL
+    savedNoSystem = process.env.GIT_CONFIG_NOSYSTEM
+    process.env.PATH = savedPath.split(path.delimiter).filter(dir => dir !== path.join(base, 'bin')).join(path.delimiter)
+    process.env.GIT_CONFIG_GLOBAL = path.join(base, 'empty-git-config')
+    fs.writeFileSync(process.env.GIT_CONFIG_GLOBAL, '')
+    process.env.GIT_CONFIG_NOSYSTEM = '1'
+  })
+  afterAll(() => {
+    process.env.PATH = savedPath
+    if (savedGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL
+    else process.env.GIT_CONFIG_GLOBAL = savedGlobalConfig
+    if (savedNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM
+    else process.env.GIT_CONFIG_NOSYSTEM = savedNoSystem
+  })
+
+  it('commits only selected files and preserves unrelated staged changes', async () => {
+    const dir = makeRepo()
+    fs.writeFileSync(path.join(dir, 'staged.txt'), 'before\n')
+    git(dir, ['add', '.'])
+    git(dir, ['commit', '-qm', 'initial'])
+    fs.writeFileSync(path.join(dir, 'staged.txt'), 'already staged\n')
+    fs.writeFileSync(path.join(dir, 'modules-registry.tf'), 'selected module\n')
+    fs.writeFileSync(path.join(dir, 'tf.plan'), 'unselected plan\n')
+    git(dir, ['add', 'staged.txt'])
+    fs.writeFileSync(path.join(dir, 'staged.txt'), 'unstaged after staging\n')
+    const res = await request(app).post('/api/git/commit').send({ path: dir, message: 'selected', files: ['modules-registry.tf'] })
+    expect(res.status).toBe(200)
+    expect(res.body.committed).toBe(true)
+    expect(git(dir, ['show', '--format=', '--name-only', 'HEAD'])).toBe('modules-registry.tf')
+    expect(git(dir, ['diff', '--cached', '--name-only'])).toBe('staged.txt')
+    expect(git(dir, ['show', ':staged.txt'])).toBe('already staged')
+    expect(fs.readFileSync(path.join(dir, 'staged.txt'), 'utf-8')).toBe('unstaged after staging\n')
+    expect(fs.readFileSync(path.join(dir, 'tf.plan'), 'utf-8')).toBe('unselected plan\n')
+  })
+
+  it('does not commit unrelated staged files when the selected file has no changes', async () => {
+    const dir = makeRepo()
+    fs.writeFileSync(path.join(dir, 'selected.txt'), 'unchanged\n')
+    fs.writeFileSync(path.join(dir, 'staged.txt'), 'before\n')
+    git(dir, ['add', '.'])
+    git(dir, ['commit', '-qm', 'initial'])
+    const before = git(dir, ['rev-parse', 'HEAD'])
+    fs.writeFileSync(path.join(dir, 'staged.txt'), 'other change\n')
+    git(dir, ['add', 'staged.txt'])
+    const res = await request(app).post('/api/git/commit').send({ path: dir, message: 'selected', files: ['selected.txt'] })
+    expect(res.status).toBe(200)
+    expect(res.body.committed).toBe(false)
+    expect(git(dir, ['rev-parse', 'HEAD'])).toBe(before)
+    expect(git(dir, ['diff', '--cached', '--name-only'])).toBe('staged.txt')
+  })
+
+  it('rejects a malformed explicit file list without staging anything', async () => {
+    const dir = makeRepo()
+    fs.writeFileSync(path.join(dir, 'new.txt'), 'untracked\n')
+    const res = await request(app).post('/api/git/commit').send({ path: dir, message: 'invalid', files: null })
+    expect(res.status).toBe(400)
+    expect(git(dir, ['status', '--porcelain'])).toBe('?? new.txt')
+  })
+
+  it('commits only a selected file when creating the first commit', async () => {
+    const dir = makeRepo()
+    fs.writeFileSync(path.join(dir, 'selected.tf'), 'selected\n')
+    fs.writeFileSync(path.join(dir, 'staged.tf'), 'staged\n')
+    git(dir, ['add', 'staged.tf'])
+    const res = await request(app).post('/api/git/commit').send({ path: dir, message: 'initial', files: ['selected.tf'] })
+    expect(res.status).toBe(200)
+    expect(res.body.committed).toBe(true)
+    expect(git(dir, ['show', '--format=', '--name-only', 'HEAD'])).toBe('selected.tf')
+    expect(git(dir, ['diff', '--cached', '--name-only'])).toBe('staged.tf')
+  })
+
+  it('uses a literal filename instead of expanding Git pathspec patterns', async () => {
+    const dir = makeRepo()
+    fs.writeFileSync(path.join(dir, '*.tf'), 'selected\n')
+    fs.writeFileSync(path.join(dir, 'other.tf'), 'untracked\n')
+    const res = await request(app).post('/api/git/commit').send({ path: dir, message: 'literal', files: ['*.tf'] })
+    expect(res.status).toBe(200)
+    expect(res.body.committed).toBe(true)
+    expect(git(dir, ['show', '--format=', '--name-only', 'HEAD'])).toBe('*.tf')
+    expect(git(dir, ['status', '--porcelain'])).toBe('?? other.tf')
+  })
+
+  it('commits selected deletions without including other staged changes', async () => {
+    const dir = makeRepo()
+    fs.writeFileSync(path.join(dir, 'delete.tf'), 'remove\n')
+    fs.writeFileSync(path.join(dir, 'staged.tf'), 'before\n')
+    git(dir, ['add', '.'])
+    git(dir, ['commit', '-qm', 'initial'])
+    fs.rmSync(path.join(dir, 'delete.tf'))
+    fs.writeFileSync(path.join(dir, 'staged.tf'), 'other change\n')
+    git(dir, ['add', 'staged.tf'])
+    const res = await request(app).post('/api/git/commit').send({ path: dir, message: 'delete', files: ['delete.tf'] })
+    expect(res.status).toBe(200)
+    expect(res.body.committed).toBe(true)
+    expect(git(dir, ['show', '--format=', '--name-status', 'HEAD'])).toBe('D\tdelete.tf')
+    expect(git(dir, ['diff', '--cached', '--name-only'])).toBe('staged.tf')
+  })
+
+  it('commits an already staged rename without including other staged changes', async () => {
+    const dir = makeRepo()
+    fs.writeFileSync(path.join(dir, 'old.tf'), 'rename\n')
+    fs.writeFileSync(path.join(dir, 'staged.tf'), 'before\n')
+    git(dir, ['add', '.'])
+    git(dir, ['commit', '-qm', 'initial'])
+    git(dir, ['mv', 'old.tf', 'new.tf'])
+    fs.writeFileSync(path.join(dir, 'staged.tf'), 'other change\n')
+    git(dir, ['add', 'staged.tf'])
+    const res = await request(app).post('/api/git/commit').send({ path: dir, message: 'rename', files: ['old.tf', 'new.tf'] })
+    expect(res.status).toBe(200)
+    expect(res.body.committed).toBe(true)
+    expect(git(dir, ['show', '--format=', '--name-status', 'HEAD'])).toBe('R100\told.tf\tnew.tf')
+    expect(git(dir, ['diff', '--cached', '--name-only'])).toBe('staged.tf')
+  })
+
+  it('commits a selected already staged deletion', async () => {
+    const dir = makeRepo()
+    fs.writeFileSync(path.join(dir, 'delete.tf'), 'remove\n')
+    git(dir, ['add', '.'])
+    git(dir, ['commit', '-qm', 'initial'])
+    git(dir, ['rm', '-q', 'delete.tf'])
+    const res = await request(app).post('/api/git/commit').send({ path: dir, message: 'delete', files: ['delete.tf'] })
+    expect(res.status).toBe(200)
+    expect(res.body.committed).toBe(true)
+    expect(git(dir, ['show', '--format=', '--name-status', 'HEAD'])).toBe('D\tdelete.tf')
+  })
+
+  it('commits a selected untracked directory while leaving other files untracked', async () => {
+    const dir = makeRepo()
+    fs.mkdirSync(path.join(dir, 'aws', 'bucket'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'aws', 'bucket', 'modules-registry.tf'), 'module\n')
+    fs.writeFileSync(path.join(dir, '.terraform-version'), '1.4.0\n')
+    const res = await request(app).post('/api/git/commit').send({ path: dir, message: 'directory', files: ['aws/'] })
+    expect(res.status).toBe(200)
+    expect(res.body.committed).toBe(true)
+    expect(git(dir, ['show', '--format=', '--name-only', 'HEAD'])).toBe('aws/bucket/modules-registry.tf')
+    expect(git(dir, ['status', '--porcelain'])).toBe('?? .terraform-version')
   })
 })

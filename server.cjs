@@ -3472,6 +3472,9 @@ app.post('/api/git/commit', async (req, res) => {
   const body = req.body ?? {};
   const rawPath = body.path;
   const message = typeof body.message === 'string' ? body.message : '';
+  if (Object.hasOwn(body, 'files') && !Array.isArray(body.files)) {
+    return res.status(400).json({ error: 'files must be an array' });
+  }
   const files = Array.isArray(body.files) ? body.files : null;
 
   if (typeof rawPath !== 'string' || !rawPath) {
@@ -3517,32 +3520,50 @@ app.post('/api/git/commit', async (req, res) => {
         if (!withinAnyRoot(absF)) {
           return res.status(403).json({ error: 'Access denied: path outside allowed directory' });
         }
-        specs.push(f);
+        const spec = `:(literal)${f}`;
+        try {
+          fs.lstatSync(absF);
+          specs.push(spec);
+        } catch (err) {
+          if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') {
+            return res.status(400).json({ error: 'Could not inspect selected file' });
+          }
+          // A previously staged deletion or rename is absent from the index.
+          // Keep it in the commit pathspec, but do not pass it to git add.
+          const tracked = await runGit(dir, ['ls-files', '--error-unmatch', '--', spec]);
+          if (tracked.error || tracked.timedOut || ![0, 1].includes(tracked.exitCode)) {
+            return res.status(500).json({ error: 'Failed to check selected file' });
+          }
+          if (tracked.exitCode === 0) specs.push(spec);
+        }
       }
-      addArgs = ['add', '--', ...specs];
+      addArgs = specs.length ? ['add', '--', ...specs] : null;
     } else {
       addArgs = ['add', '-A'];
     }
 
-    const addRes = await runGit(dir, addArgs);
-    if (addRes.error === 'enoent') {
-      return res.status(503).json({ error: 'git executable not found in PATH' });
-    }
-    if (addRes.error || addRes.timedOut || addRes.exitCode !== 0) {
-      const details = ((addRes.stdout || '') + (addRes.stderr ? `\n${addRes.stderr}` : '')).trim().slice(0, 2000);
-      return res.status(400).json({ error: 'git add failed', details });
+    if (addArgs) {
+      const addRes = await runGit(dir, addArgs);
+      if (addRes.error === 'enoent') {
+        return res.status(503).json({ error: 'git executable not found in PATH' });
+      }
+      if (addRes.error || addRes.timedOut || addRes.exitCode !== 0) {
+        const details = ((addRes.stdout || '') + (addRes.stderr ? `\n${addRes.stderr}` : '')).trim().slice(0, 2000);
+        return res.status(400).json({ error: 'git add failed', details });
+      }
     }
 
     // --quiet exits 1 when the index differs from HEAD (works on unborn HEAD too)
-    const quietRes = await runGit(dir, ['diff', '--cached', '--quiet']);
-    if (quietRes.error || quietRes.timedOut) {
+    const fileSpecs = files ? files.map(file => `:(literal)${file}`) : [];
+    const quietRes = await runGit(dir, ['diff', '--cached', '--quiet', ...(files ? ['--', ...fileSpecs] : [])]);
+    if (quietRes.error || quietRes.timedOut || ![0, 1].includes(quietRes.exitCode)) {
       return res.status(500).json({ error: 'Failed to check staged changes' });
     }
     if (quietRes.exitCode === 0) {
       return res.json({ committed: false, reason: 'nothing to commit' });
     }
 
-    const commitRes = await runGit(dir, ['commit', '-m', trimmedMsg]);
+    const commitRes = await runGit(dir, ['commit', '-m', trimmedMsg, ...(files ? ['--only', '--', ...fileSpecs] : [])]);
     if (commitRes.error || commitRes.timedOut || commitRes.exitCode !== 0) {
       const details = ((commitRes.stdout || '') + (commitRes.stderr ? `\n${commitRes.stderr}` : '')).trim().slice(0, 2000);
       return res.status(500).json({ error: 'git commit failed', details });

@@ -723,7 +723,7 @@ export type GitCommitResult = {
 // `files` is given (relative paths; renames should include both old and new).
 export function gitCommit(dirPath: string, message: string, files?: string[]): Promise<GitCommitResult> {
   const body: Record<string, unknown> = { path: dirPath, message }
-  if (files && files.length > 0) body.files = files
+  if (files !== undefined) body.files = files
   return request<GitCommitResult>(`${API_BASE}/api/git/commit`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
