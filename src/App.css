@@ -2672,9 +2672,8 @@ body.sb-resizing {
     color: #ffa657;
   }
 
-  :root:not(.theme-light) .git-status.ok {
-    color: #7ee787;
-  }
+  /* .git-status.ok keeps the base dark green (#0a7d33): the git panel stays on
+     a white sidebar background in dark themes, so a light green is invisible. */
 }
 
 .theme-dark .git-panel {
@@ -2703,9 +2702,8 @@ body.sb-resizing {
   color: #ffa657;
 }
 
-.theme-dark .git-status.ok {
-  color: #7ee787;
-}
+/* .git-status.ok keeps the base dark green (#0a7d33): the git panel stays on
+   a white sidebar background in dark themes, so a light green is invisible. */
 
 @media (prefers-color-scheme: dark) {
   :root:not(.theme-light) .git-input {
