@@ -2645,6 +2645,174 @@ describe('allowed roots (/api/roots)', () => {
     expect(fs.existsSync(extra())).toBe(true)
   })
 
+  it('refuses to rename a runtime-added root with 403', async () => {
+    const moved = path.join(root, 'extra-moved')
+    const allow = await request(app).post('/api/roots').send({ path: extra() })
+    expect(allow.status).toBe(200)
+    const res = await request(app).post('/api/rename').send({ from: extra(), to: moved })
+    expect(res.status).toBe(403)
+    expect(fs.existsSync(extra())).toBe(true)
+    expect(fs.existsSync(moved)).toBe(false)
+  })
+
+  it('refuses to rename a runtime-added root reached through a symlink with 403', async () => {
+    const allow = await request(app).post('/api/roots').send({ path: extra() })
+    expect(allow.status).toBe(200)
+    const link = path.join(root, 'link-to-extra')
+    fs.symlinkSync(extra(), link)
+    const moved = path.join(root, 'extra-moved-link')
+    const res = await request(app).post('/api/rename').send({ from: link, to: moved })
+    expect(res.status).toBe(403)
+    // Original root intact, destination absent, roots list unchanged.
+    expect(fs.existsSync(extra())).toBe(true)
+    expect(fs.existsSync(moved)).toBe(false)
+    const roots = await request(app).get('/api/roots')
+    expect(roots.body.roots).toContain(extra())
+    fs.rmSync(link, { force: true })
+    fs.rmSync(moved, { recursive: true, force: true })
+  })
+
+  it('refuses to rename a parent containing a nested allowed root with 403', async () => {
+    const team = path.join(root, 'team')
+    const project = path.join(team, 'project')
+    fs.mkdirSync(project, { recursive: true })
+    fs.writeFileSync(path.join(project, 'main.tf'), 'resource "null_resource" "x" {}\n')
+    const allow = await request(app).post('/api/roots').send({ path: project })
+    expect(allow.status).toBe(200)
+
+    const moved = path.join(root, 'team-moved')
+    const res = await request(app).post('/api/rename').send({ from: team, to: moved })
+    expect(res.status).toBe(403)
+    // Original tree and contents intact, destination absent, roots list unchanged.
+    expect(fs.existsSync(path.join(project, 'main.tf'))).toBe(true)
+    expect(fs.readFileSync(path.join(project, 'main.tf'), 'utf-8')).toContain('null_resource')
+    expect(fs.existsSync(moved)).toBe(false)
+    const roots = await request(app).get('/api/roots')
+    expect(roots.body.roots).toContain(project)
+
+    // Ordinary children inside the nested root can still be renamed.
+    fs.writeFileSync(path.join(project, 'child.txt'), 'c\n')
+    const childRes = await request(app)
+      .post('/api/rename')
+      .send({ from: path.join(project, 'child.txt'), to: path.join(project, 'renamed-child.txt') })
+    expect(childRes.status).toBe(200)
+    expect(fs.existsSync(path.join(project, 'renamed-child.txt'))).toBe(true)
+
+    // A similarly named sibling of the registered root is not protected.
+    const backup = path.join(team, 'project-backup')
+    fs.mkdirSync(backup)
+    fs.writeFileSync(path.join(backup, 'b.txt'), 'b\n')
+    const sibRes = await request(app)
+      .post('/api/rename')
+      .send({ from: backup, to: path.join(root, 'backup-moved') })
+    expect(sibRes.status).toBe(200)
+    expect(fs.existsSync(path.join(root, 'backup-moved', 'b.txt'))).toBe(true)
+
+    // Cleanup so later suites see a pristine roots list.
+    await request(app).delete('/api/roots').query({ path: project })
+    fs.rmSync(team, { recursive: true, force: true })
+    fs.rmSync(path.join(root, 'backup-moved'), { recursive: true, force: true })
+  })
+
+  it('refuses to recursively delete a parent containing a nested allowed root with 403', async () => {
+    const team = path.join(root, 'team-del')
+    const project = path.join(team, 'project')
+    fs.mkdirSync(project, { recursive: true })
+    fs.writeFileSync(path.join(project, 'main.tf'), 'x\n')
+    const allow = await request(app).post('/api/roots').send({ path: project })
+    expect(allow.status).toBe(200)
+
+    const res = await request(app).delete('/api/files').query({ path: team })
+    expect(res.status).toBe(403)
+    // Original tree and contents intact, roots list unchanged.
+    expect(fs.existsSync(path.join(project, 'main.tf'))).toBe(true)
+    const roots = await request(app).get('/api/roots')
+    expect(roots.body.roots).toContain(project)
+
+    // Ordinary subdirectories inside the nested root can still be deleted.
+    fs.mkdirSync(path.join(project, 'scratch'), { recursive: true })
+    fs.writeFileSync(path.join(project, 'scratch', 'f.txt'), 's\n')
+    const delRes = await request(app).delete('/api/files').query({ path: path.join(project, 'scratch') })
+    expect(delRes.status).toBe(200)
+    expect(fs.existsSync(path.join(project, 'scratch'))).toBe(false)
+
+    // Cleanup so later suites see a pristine roots list.
+    await request(app).delete('/api/roots').query({ path: project })
+    fs.rmSync(team, { recursive: true, force: true })
+  })
+
+  it('refuses to rename a parent containing a nested root named "..project" with 403', async () => {
+    const team = path.join(root, 'dd-rename')
+    const project = path.join(team, '..project')
+    fs.mkdirSync(project, { recursive: true })
+    fs.writeFileSync(path.join(project, 'main.tf'), 'x\n')
+    const allow = await request(app).post('/api/roots').send({ path: project })
+    expect(allow.status).toBe(200)
+
+    const moved = path.join(root, 'dd-rename-moved')
+    const res = await request(app).post('/api/rename').send({ from: team, to: moved })
+    expect(res.status).toBe(403)
+    // Original tree and contents intact, destination absent.
+    expect(fs.existsSync(path.join(project, 'main.tf'))).toBe(true)
+    expect(fs.readFileSync(path.join(project, 'main.tf'), 'utf-8')).toContain('x')
+    expect(fs.existsSync(moved)).toBe(false)
+    // /api/roots still lists the registered root.
+    const roots = await request(app).get('/api/roots')
+    expect(roots.body.roots).toContain(project)
+
+    // Ordinary siblings can still be renamed...
+    const sib = path.join(team, 'plain-sib')
+    fs.mkdirSync(sib)
+    fs.writeFileSync(path.join(sib, 's.txt'), 's\n')
+    const sibRes = await request(app)
+      .post('/api/rename')
+      .send({ from: sib, to: path.join(root, 'dd-plain-moved') })
+    expect(sibRes.status).toBe(200)
+
+    // ...and deleted.
+    const delSib = path.join(team, 'plain-del')
+    fs.mkdirSync(delSib)
+    const delRes = await request(app).delete('/api/files').query({ path: delSib })
+    expect(delRes.status).toBe(200)
+
+    // Paths outside allowed roots remain blocked.
+    const outRes = await request(app)
+      .post('/api/rename')
+      .send({ from: path.join(base, 'outside.txt'), to: path.join(root, 'stolen-dd.txt') })
+    expect(outRes.status).toBe(403)
+
+    // Cleanup so later suites see a pristine roots list.
+    await request(app).delete('/api/roots').query({ path: project })
+    fs.rmSync(team, { recursive: true, force: true })
+    fs.rmSync(path.join(root, 'dd-plain-moved'), { recursive: true, force: true })
+  })
+
+  it('refuses to recursively delete a parent containing a nested root named "..project" with 403', async () => {
+    const team = path.join(root, 'dd-delete')
+    const project = path.join(team, '..project')
+    fs.mkdirSync(project, { recursive: true })
+    fs.writeFileSync(path.join(project, 'main.tf'), 'x\n')
+    const allow = await request(app).post('/api/roots').send({ path: project })
+    expect(allow.status).toBe(200)
+
+    const res = await request(app).delete('/api/files').query({ path: team })
+    expect(res.status).toBe(403)
+    // Contents intact, roots list unchanged.
+    expect(fs.existsSync(path.join(project, 'main.tf'))).toBe(true)
+    const roots = await request(app).get('/api/roots')
+    expect(roots.body.roots).toContain(project)
+
+    // Ordinary subdirectories inside the nested root can still be deleted.
+    fs.mkdirSync(path.join(project, 'scratch'), { recursive: true })
+    fs.writeFileSync(path.join(project, 'scratch', 'f.txt'), 's\n')
+    const delRes = await request(app).delete('/api/files').query({ path: path.join(project, 'scratch') })
+    expect(delRes.status).toBe(200)
+
+    // Cleanup so later suites see a pristine roots list.
+    await request(app).delete('/api/roots').query({ path: project })
+    fs.rmSync(team, { recursive: true, force: true })
+  })
+
   it('rejects a missing directory with 404', async () => {
     const res = await request(app).post('/api/roots').send({ path: path.join(base, 'nope') })
     expect(res.status).toBe(404)

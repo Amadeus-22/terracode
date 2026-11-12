@@ -560,6 +560,29 @@ app.post('/api/files', (req, res) => {
 });
 
 // API endpoint: rename or move a file/directory within the allowed root
+// True when realPath is one of the allowed roots itself, or a directory that
+// contains another active allowed root (compared by canonical path). Renaming
+// or recursively deleting such a path would move or remove the folder the user
+// opened while /api/roots keeps listing it, so both operations refuse it.
+// Only ".." and paths starting with ".." + sep point outside the source
+// directory; a child literally named "..project" stays protected.
+function isOrContainsAllowedRoot(realPath) {
+  for (const r of allRoots()) {
+    let real;
+    try {
+      real = fs.realpathSync(r);
+    } catch {
+      continue; // root does not exist yet
+    }
+    if (real === realPath) return true;
+    const rel = path.relative(realPath, real);
+    if (rel !== '' && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 app.post('/api/rename', (req, res) => {
   const body = req.body ?? {};
   const from = body.from;
@@ -575,6 +598,10 @@ app.post('/api/rename', (req, res) => {
   if (!respondResolve(res, dstCheck)) return;
   const source = srcCheck.path;
   const target = dstCheck.path;
+
+  if (isOrContainsAllowedRoot(source)) {
+    return res.status(403).json({ error: 'Cannot rename a directory that is or contains an allowed root' });
+  }
 
   try {
     fs.statSync(target); // destination must not exist
@@ -609,17 +636,8 @@ app.delete('/api/files', (req, res) => {
   if (!respondResolve(res, resolved)) return;
   const target = resolved.path;
 
-  // Never allow deleting an allowed root directory itself.
-  for (const r of allRoots()) {
-    let real;
-    try {
-      real = fs.realpathSync(r);
-    } catch {
-      continue;
-    }
-    if (target === real) {
-      return res.status(403).json({ error: 'Cannot delete an allowed root directory' });
-    }
+  if (isOrContainsAllowedRoot(target)) {
+    return res.status(403).json({ error: 'Cannot delete a directory that is or contains an allowed root' });
   }
 
   try {
