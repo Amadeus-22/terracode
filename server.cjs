@@ -564,8 +564,8 @@ app.post('/api/files', (req, res) => {
 // contains another active allowed root (compared by canonical path). Renaming
 // or recursively deleting such a path would move or remove the folder the user
 // opened while /api/roots keeps listing it, so both operations refuse it.
-// path.relative compares on full segments, so a sibling like "project-backup"
-// is never treated as being inside "project".
+// Only ".." and paths starting with ".." + sep point outside the source
+// directory; a child literally named "..project" stays protected.
 function isOrContainsAllowedRoot(realPath) {
   for (const r of allRoots()) {
     let real;
@@ -576,7 +576,9 @@ function isOrContainsAllowedRoot(realPath) {
     }
     if (real === realPath) return true;
     const rel = path.relative(realPath, real);
-    if (rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel)) return true;
+    if (rel !== '' && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel)) {
+      return true;
+    }
   }
   return false;
 }
