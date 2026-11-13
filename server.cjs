@@ -460,22 +460,46 @@ app.post('/api/replace', (req, res) => {
       return res.status(415).json({ error: 'Binary file: replace not supported' });
     }
 
-    let updated;
-    let count;
+    // Count matches per mode and accumulate their byte length so an oversized
+    // result can be rejected before it is built.
+    let count = 0;
+    let matchedBytes = 0;
+    const escFind = find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     if (re) {
       const m = original.match(re);
-      count = m ? m.length : 0;
-      updated = original.replace(re, replacement);
-    } else if (isCase) {
-      const parts = original.split(find);
-      count = parts.length - 1;
-      updated = parts.join(replacement);
+      if (m !== null) {
+        count = m.length;
+        for (const s of m) matchedBytes += Buffer.byteLength(s, 'utf-8');
+      }
+    } else if (!isCase) {
+      const m = original.match(new RegExp(escFind, 'gi'));
+      if (m !== null) {
+        count = m.length;
+        for (const s of m) matchedBytes += Buffer.byteLength(s, 'utf-8');
+      }
     } else {
-      const esc = find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const cre = new RegExp(esc, 'gi');
-      const m = original.match(cre);
-      count = m ? m.length : 0;
-      updated = original.replace(cre, replacement);
+      count = original.split(find).length - 1;
+      matchedBytes = count * Buffer.byteLength(find, 'utf-8');
+    }
+
+    // A plain replacement swaps each match for the same bytes, so the final size
+    // is exact and can be checked before building the result (a large expansion
+    // must not allocate first). "$" patterns expand per match (capture groups,
+    // $&, $`, $') and keep the build-then-check backstop below.
+    if (count > 0 && replacement !== '' && !replacement.includes('$')) {
+      const finalBytes = Buffer.byteLength(original, 'utf-8') - matchedBytes + count * Buffer.byteLength(replacement, 'utf-8');
+      if (finalBytes > MAX_FILE_SIZE) {
+        return res.status(413).json(CONTENT_TOO_LARGE);
+      }
+    }
+
+    let updated;
+    if (re) {
+      updated = original.replace(re, replacement);
+    } else if (!isCase) {
+      updated = original.replace(new RegExp(escFind, 'gi'), replacement);
+    } else {
+      updated = original.split(find).join(replacement);
     }
 
     if (count === 0 || updated === original) {
