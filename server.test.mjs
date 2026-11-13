@@ -1014,13 +1014,109 @@ describe('POST /api/replace', () => {
   })
 
   it('still refuses a "$"-pattern replacement that grows the file over the limit', async () => {
-    // $& expands per match (here to "aa"), so this takes the build-then-check
-    // backstop instead of the exact-size pre-check.
+    // $& expands per match and its output must respect the same limit.
     const original = 'a'.repeat(600 * 1024)
     const p = mkFile('grow-dollar.txt', original)
     const res = await request(app).post('/api/replace').send({ path: p, find: 'a', replacement: '$&$&' })
     expect(res.status).toBe(413)
     expect(fs.readFileSync(p, 'utf-8')).toBe(original)
+  })
+
+  it('accepts surrogate pairs formed across replacement boundaries', async () => {
+    const original = 'a'.repeat(180000)
+    const replacement = String.fromCharCode(0xde00, 0xd83d)
+    const expected = original.split('a').join(replacement)
+    expect(Buffer.byteLength(expected, 'utf-8')).toBe(720002)
+    const p = mkFile('surrogate-boundaries.txt', original)
+    const res = await request(app).post('/api/replace').send({ path: p, find: 'a', replacement, caseSensitive: true })
+    expect(res.status).toBe(200)
+    expect(fs.readFileSync(p, 'utf-8')).toBe(Buffer.from(expected, 'utf-8').toString('utf-8'))
+  })
+
+  it('rejects a large literal dollar replacement before allocating it', async () => {
+    const original = 'a'.repeat(10000)
+    const p = mkFile('literal-dollar-huge.txt', original)
+    const res = await request(app).post('/api/replace').send({
+      path: p, find: 'a', replacement: '$' + 'x'.repeat(60000), caseSensitive: true
+    })
+    expect(res.status).toBe(413)
+    expect(fs.readFileSync(p, 'utf-8')).toBe(original)
+  })
+
+  it('rejects large prefix and suffix substitutions before constructing the output', async () => {
+    const original = 'a'.repeat(50000)
+    for (const [name, replacement] of [['prefix', '$`'], ['suffix', "$'"]]) {
+      const p = mkFile(`grow-${name}.txt`, original)
+      const res = await request(app).post('/api/replace').send({ path: p, find: 'a', replacement, regex: true })
+      expect(res.status).toBe(413)
+      expect(fs.readFileSync(p, 'utf-8')).toBe(original)
+    }
+  })
+
+  it('measures prefix substitutions on both sides of the limit', async () => {
+    const replacement = '$`'
+    const below = 'a'.repeat(1448)
+    const expected = below.replace(/a/g, replacement)
+    expect(Buffer.byteLength(expected)).toBeLessThanOrEqual(1024 * 1024)
+    const belowPath = mkFile('prefix-below.txt', below)
+    const ok = await request(app).post('/api/replace').send({ path: belowPath, find: 'a', replacement, regex: true })
+    expect(ok.status).toBe(200)
+    expect(fs.readFileSync(belowPath, 'utf-8')).toBe(expected)
+
+    const above = 'a'.repeat(1449)
+    expect(Buffer.byteLength(above.replace(/a/g, replacement))).toBeGreaterThan(1024 * 1024)
+    const abovePath = mkFile('prefix-above.txt', above)
+    const rejected = await request(app).post('/api/replace').send({ path: abovePath, find: 'a', replacement, regex: true })
+    expect(rejected.status).toBe(413)
+    expect(fs.readFileSync(abovePath, 'utf-8')).toBe(above)
+  })
+
+  it('handles repeated empty capture expansions without constructing large intermediates', async () => {
+    const original = 'ab'.repeat(15000)
+    const p = mkFile('empty-captures.txt', original)
+    const res = await request(app).post('/api/replace').send({
+      path: p, find: '()(a|b)', replacement: '$1'.repeat(30000), regex: true
+    })
+    expect(res.status).toBe(200)
+    expect(res.body.replaced).toBe(30000)
+    expect(fs.readFileSync(p, 'utf-8')).toBe('')
+  })
+
+  it('preserves JavaScript replacement semantics for captures, zero-width matches, and literal dollars', async () => {
+    const cases = [
+      { text: 'ab a', find: '(a)(b)?', replacement: '$$-$&-$1-$2-$01-$12-$99', regex: true, caseSensitive: true },
+      { text: 'aA', find: '(?<word>a)', replacement: '$<word>-$<missing>-$1', regex: true, caseSensitive: false },
+      { text: 'abcdefghij', find: '(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)', replacement: '$10-$09-$01-$12', regex: true, caseSensitive: true },
+      { text: 'aba', find: 'a', replacement: '$`|$\'|$&', regex: true, caseSensitive: true },
+      { text: 'aa', find: '(?=a)', replacement: 'x', regex: true, caseSensitive: true },
+      { text: '😀😀', find: '(?=.)', replacement: 'x', regex: true, caseSensitive: true },
+      { text: 'a.A.a', find: '.', replacement: '$1', regex: false, caseSensitive: true },
+      { text: 'a.A.a', find: 'a', replacement: '$&$$', regex: false, caseSensitive: false }
+    ]
+    for (const [index, c] of cases.entries()) {
+      let expected
+      let matches
+      if (c.regex) {
+        const pattern = new RegExp(c.find, c.caseSensitive ? 'g' : 'gi')
+        expected = c.text.replace(pattern, c.replacement)
+        matches = c.text.match(pattern)?.length ?? 0
+      } else if (c.caseSensitive) {
+        const pieces = c.text.split(c.find)
+        expected = pieces.join(c.replacement)
+        matches = pieces.length - 1
+      } else {
+        const escaped = c.find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        const pattern = new RegExp(escaped, 'gi')
+        expected = c.text.replace(pattern, c.replacement)
+        matches = c.text.match(pattern)?.length ?? 0
+      }
+      const p = mkFile(`replace-semantics-${index}.txt`, c.text)
+      const res = await request(app).post('/api/replace').send({ path: p, ...c })
+      expect(res.status).toBe(200)
+      expect(res.body.replaced).toBe(expected === c.text ? 0 : matches)
+      // File writes encode lone UTF-16 surrogates as replacement characters.
+      expect(fs.readFileSync(p, 'utf-8')).toBe(Buffer.from(expected, 'utf-8').toString('utf-8'))
+    }
   })
 
   it('replaces case-sensitively when requested', async () => {

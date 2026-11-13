@@ -406,6 +406,131 @@ app.get('/api/search', (req, res) => {
   res.json(results);
 });
 
+// Parse the substitution tokens used by String.replace. Case-sensitive literal
+// replacement uses split/join instead, so its replacement is always literal.
+function replacementParts(replacement, captureCount, hasNamedCaptures) {
+  const parts = [];
+  let literalStart = 0;
+  let i = 0;
+  while (i < replacement.length - 1) {
+    if (replacement[i] !== '$') { i++; continue; }
+    const next = replacement[i + 1];
+    let part = null;
+    let end = i + 2;
+    if (next === '$') part = { type: 'text', value: '$' };
+    else if (next === '&') part = { type: 'match' };
+    else if (next === '`') part = { type: 'prefix' };
+    else if (next === "'") part = { type: 'suffix' };
+    else if (next === '<' && hasNamedCaptures) {
+      const close = replacement.indexOf('>', i + 2);
+      if (close !== -1) {
+        part = { type: 'named', value: replacement.slice(i + 2, close) };
+        end = close + 1;
+      }
+    } else if (next >= '0' && next <= '9') {
+      const first = Number(next);
+      const second = replacement[i + 2];
+      const pair = second >= '0' && second <= '9' ? first * 10 + Number(second) : 0;
+      if (pair > 0 && pair <= captureCount) {
+        part = { type: 'capture', value: pair };
+        end = i + 3;
+      } else if (first > 0 && first <= captureCount) {
+        part = { type: 'capture', value: first };
+      }
+    }
+    if (part === null) { i++; continue; }
+    if (i > literalStart) parts.push({ type: 'text', value: replacement.slice(literalStart, i) });
+    parts.push(part);
+    i = end;
+    literalStart = end;
+  }
+  if (literalStart < replacement.length) parts.push({ type: 'text', value: replacement.slice(literalStart) });
+  return parts;
+}
+
+// Build only bounded UTF-8 output. Pieces can join a high and a low surrogate
+// across a boundary, so their byte lengths are not simply additive.
+function boundedReplacement(original, find, replacement, isCase, re) {
+  const matcher = re || (isCase ? null : new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'));
+  let parts = matcher ? null : [{ type: 'text', value: replacement }];
+  let canCache = false;
+  let cacheDeps = [];
+  let cachedValues = null;
+  let cachedExpansion = '';
+  const chunks = [];
+  let bytes = 0;
+  let last = -1;
+  let cursor = 0;
+  let count = 0;
+  const isHigh = n => n >= 0xd800 && n <= 0xdbff;
+  const isLow = n => n >= 0xdc00 && n <= 0xdfff;
+  const append = piece => {
+    if (!piece) return false;
+    bytes += Buffer.byteLength(piece, 'utf-8');
+    if (isHigh(last) && isLow(piece.charCodeAt(0))) bytes -= 2;
+    last = piece.charCodeAt(piece.length - 1);
+    // A following low surrogate can reduce the current byte count by two.
+    if (bytes > MAX_FILE_SIZE + (isHigh(last) ? 2 : 0)) return true;
+    chunks.push(piece);
+    return false;
+  };
+  while (true) {
+    let match;
+    if (matcher) {
+      match = matcher.exec(original);
+    } else {
+      const index = original.indexOf(find, cursor);
+      match = index === -1 ? null : Object.assign([find], { index });
+    }
+    if (match === null) break;
+    count++;
+    if (append(original.slice(cursor, match.index))) return { count, tooLarge: true };
+    if (parts === null) {
+      parts = replacementParts(replacement, match.length - 1, match.groups !== undefined);
+      canCache = !parts.some(part => part.type === 'prefix' || part.type === 'suffix');
+      const seen = new Set();
+      cacheDeps = parts.filter(part => {
+        if (!['match', 'capture', 'named'].includes(part.type)) return false;
+        const key = `${part.type}:${part.value ?? ''}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
+    const resolvePart = part => {
+      if (part.type === 'text') return part.value;
+      if (part.type === 'match') return match[0];
+      if (part.type === 'prefix') return original.slice(0, match.index);
+      if (part.type === 'suffix') return original.slice(match.index + match[0].length);
+      if (part.type === 'capture') return match[part.value] ?? '';
+      return match.groups[part.value] ?? '';
+    };
+    const values = canCache ? cacheDeps.map(resolvePart) : null;
+    if (values !== null && cachedValues !== null &&
+        cachedValues.every((value, index) => value === values[index])) {
+      if (append(cachedExpansion)) return { count, tooLarge: true };
+    } else {
+      const expansion = canCache ? [] : null;
+      for (const part of parts) {
+        const piece = resolvePart(part);
+        if (append(piece)) return { count, tooLarge: true };
+        if (expansion !== null && piece) expansion.push(piece);
+      }
+      if (expansion !== null) {
+        cachedValues = values;
+        cachedExpansion = expansion.join('');
+      }
+    }
+    cursor = match.index + match[0].length;
+    // The regexes used here have no Unicode flag; zero-width matches advance
+    // by one UTF-16 code unit, just as String.replace does.
+    if (matcher && match[0].length === 0) matcher.lastIndex = match.index + 1;
+  }
+  if (count === 0) return { count, tooLarge: false, updated: original };
+  if (append(original.slice(cursor)) || bytes > MAX_FILE_SIZE) return { count, tooLarge: true };
+  return { count, tooLarge: false, updated: chunks.join('') };
+}
+
 // API endpoint: replace occurrences of a pattern within a single file. Reuses the
 // same conflict-safe write path as PUT /api/file-content (optional mtimeMs check).
 // Body: { path, find, replacement, regex?, caseSensitive?, mtimeMs? }. Returns the
@@ -460,47 +585,8 @@ app.post('/api/replace', (req, res) => {
       return res.status(415).json({ error: 'Binary file: replace not supported' });
     }
 
-    // Count matches per mode and accumulate their byte length so an oversized
-    // result can be rejected before it is built.
-    let count = 0;
-    let matchedBytes = 0;
-    const escFind = find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    if (re) {
-      const m = original.match(re);
-      if (m !== null) {
-        count = m.length;
-        for (const s of m) matchedBytes += Buffer.byteLength(s, 'utf-8');
-      }
-    } else if (!isCase) {
-      const m = original.match(new RegExp(escFind, 'gi'));
-      if (m !== null) {
-        count = m.length;
-        for (const s of m) matchedBytes += Buffer.byteLength(s, 'utf-8');
-      }
-    } else {
-      count = original.split(find).length - 1;
-      matchedBytes = count * Buffer.byteLength(find, 'utf-8');
-    }
-
-    // A plain replacement swaps each match for the same bytes, so the final size
-    // is exact and can be checked before building the result (a large expansion
-    // must not allocate first). "$" patterns expand per match (capture groups,
-    // $&, $`, $') and keep the build-then-check backstop below.
-    if (count > 0 && replacement !== '' && !replacement.includes('$')) {
-      const finalBytes = Buffer.byteLength(original, 'utf-8') - matchedBytes + count * Buffer.byteLength(replacement, 'utf-8');
-      if (finalBytes > MAX_FILE_SIZE) {
-        return res.status(413).json(CONTENT_TOO_LARGE);
-      }
-    }
-
-    let updated;
-    if (re) {
-      updated = original.replace(re, replacement);
-    } else if (!isCase) {
-      updated = original.replace(new RegExp(escFind, 'gi'), replacement);
-    } else {
-      updated = original.split(find).join(replacement);
-    }
+    const { count, tooLarge, updated } = boundedReplacement(original, find, replacement, isCase, re);
+    if (tooLarge) return res.status(413).json(CONTENT_TOO_LARGE);
 
     if (count === 0 || updated === original) {
       return res.json({ replaced: 0, path: filePath, mtimeMs: stat.mtimeMs });
